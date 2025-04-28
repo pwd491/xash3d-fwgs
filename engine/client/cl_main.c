@@ -3038,12 +3038,13 @@ void CL_UpdateInfo( const char *key, const char *value )
 		MSG_WriteString( &cls.netchan.message, cls.userinfo );
 		break;
 	case PROTO_GOLDSRC:
-		if( !Q_stricmp( key, "name" ) && Q_strnicmp( value, "[Xash3D]", 8 ))
-		{
-			// always prepend [Xash3D] on GoldSrc protocol :)
-			CL_ServerCommand( true, "setinfo \"%s\" \"[Xash3D]%s\"\n", key, value );
-			break;
-		}
+		// if( !Q_stricmp( key, "name" ) && Q_strnicmp( value, "[Xash3D]", 8 ))
+		// {
+		// 	// always prepend [Xash3D] on GoldSrc protocol :)
+		// 	CL_ServerCommand( true, "setinfo \"%s\" \"[Xash3D]%s\"\n", key, value );
+		// 	break;
+		// }
+		break;
 		// intentional fallthrough
 	default:
 		CL_ServerCommand( true, "setinfo \"%s\" \"%s\"\n", key, value );
