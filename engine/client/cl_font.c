@@ -216,6 +216,14 @@ int CL_DrawCharacter( float x, float y, int number, const rgba_t color, cl_font_
 	w = ( rc->right - rc->left ) * font->scale;
 	h = ( rc->bottom - rc->top ) * font->scale;
 
+	// Корректировка позиции для кириллических символов (CP1251)
+	if( number >= 0xC0 && number <= 0xFF ) // Диапазон кириллицы в CP1251
+	{
+		float charWidth = font->charWidths[number];
+		float visualWidth = w;
+		x += (charWidth - visualWidth) * 0.5f; // Центрирование символа
+	}
+
 	if( FBitSet( flags, FONT_DRAW_HUD ))
 		SPR_AdjustSize( &x, &y, &w, &h );
 
