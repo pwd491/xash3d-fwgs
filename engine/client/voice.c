@@ -608,22 +608,34 @@ Process GoldSrc voice data and return number of samples
 */
 static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
 {
+    uint32_t crc_in_packet;
+    uint32_t crc;
+    size_t offset;
+    int16_t pcm[GS_MAX_DECOMPRESSED_SAMPLES];
+    size_t output_samples;
+    uint16_t sample_rate;
+    uint8_t vpc_type;
+    uint16_t data_len;
+    OpusDecoder *decoder;
+    size_t opus_offset;
+    int decoded;
+    size_t silence_samples;
+
     if (!data || size < 18 || size < 4 || ent <= 0 || ent > cl.maxclients)
         return 0;
 
-	uint32_t crc_in_packet = read_le32(data + size - 4);
-	uint32_t crc = CRC32_INIT_VALUE;
-	CRC32_ProcessBuffer(&crc, data, size - 4);
-	crc = CRC32_Final(crc);
+    crc_in_packet = read_le32(data + size - 4);
+    crc = CRC32_INIT_VALUE;
+    CRC32_ProcessBuffer(&crc, data, size - 4);
+    crc = CRC32_Final(crc);
 
     if (crc != crc_in_packet) {
         Con_Printf( S_WARN "Voice packet CRC32 mismatch\n" );
         return 0;
     }
 
-    size_t offset = 8;
-    int16_t pcm[GS_MAX_DECOMPRESSED_SAMPLES];
-    size_t output_samples = 0;
+    offset = 8;
+    output_samples = 0;
 
     if (offset >= size - 4 || data[offset] != GS_VPC_SETSAMPLERATE) {
         Con_Printf( S_WARN "Invalid voice packet type: %d\n", data[offset] );
@@ -634,11 +646,11 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
     if (offset + 4 > size - 4)
         return 0;
 
-    uint16_t sample_rate = read_le16(data + offset);
+    sample_rate = read_le16(data + offset);
     offset += 2;
 
-    uint8_t vpc_type = data[offset++];
-    uint16_t data_len = read_le16(data + offset);
+    vpc_type = data[offset++];
+    data_len = read_le16(data + offset);
     offset += 2;
 
     if (offset + data_len > size - 4) {
@@ -647,12 +659,12 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
     }
 
     if (vpc_type == GS_VPC_VDATA_OPUS_PLC) {
-        OpusDecoder *decoder = voice.gs_decoders[ent];
+        decoder = voice.gs_decoders[ent];
         if (!decoder) {
             Con_Printf( S_WARN "No decoder available for entity %d\n", ent );
             return 0;
         }
-        size_t opus_offset = 0;
+        opus_offset = 0;
         while (opus_offset + 4 <= data_len) {
             uint16_t frame_size = read_le16(data + offset + opus_offset);
             opus_offset += 4;
@@ -668,14 +680,14 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
             }
             if (frame_size == 0xFFFF) {
                 opus_decoder_ctl(decoder, OPUS_RESET_STATE);
-			break;
+                break;
             }
             if (opus_offset + frame_size > data_len) {
                 Con_Printf( S_WARN "Opus frame size exceeds data length\n" );
                 return 0;
             }
-            int decoded = opus_decode(decoder, data + offset + opus_offset, frame_size,
-				pcm + output_samples, GS_MAX_DECOMPRESSED_SAMPLES - output_samples, 0);
+            decoded = opus_decode(decoder, data + offset + opus_offset, frame_size,
+                pcm + output_samples, GS_MAX_DECOMPRESSED_SAMPLES - output_samples, 0);
             if (decoded < 0) {
                 Con_Printf( S_WARN "Opus decode error: %s\n", opus_strerror(decoded) );
                 return 0;
@@ -684,7 +696,7 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
             opus_offset += frame_size;
         }
     } else if (vpc_type == GS_VPC_VDATA_SILENCE) {
-        size_t silence_samples = data_len / 2;
+        silence_samples = data_len / 2;
         if (silence_samples > GS_MAX_DECOMPRESSED_SAMPLES) {
             Con_Printf( S_WARN "Silence data too large\n" );
             return 0;
@@ -756,50 +768,53 @@ Generate a unique SteamID for voice packets
 =========================
 */
 void Voice_GenerateSteamID( uint8_t *steamid )
-{	
-	static qboolean initialized = false;
-	static uint8_t cached_steamid[8];
-	
-	if (!initialized)
-	{
-		const char *id_md5 = ID_GetMD5();
-		uint32_t crc;
-		
-		if (id_md5 && id_md5[0])
-		{
-			CRC32_Init( &crc );
-			CRC32_ProcessBuffer( &crc, id_md5, Q_strlen( id_md5 ));
-			crc = CRC32_Final( crc );
-			
-			cached_steamid[0] = (uint8_t)(crc & 0xFF);
-			cached_steamid[1] = (uint8_t)((crc >> 8) & 0xFF);
-			cached_steamid[2] = (uint8_t)((crc >> 16) & 0xFF);
-			cached_steamid[3] = (uint8_t)((crc >> 24) & 0xFF);
-		}
-		else
-		{
-			uint32_t time_id = (uint32_t)(Sys_DoubleTime() * 1000.0);
-			cached_steamid[0] = (uint8_t)(time_id & 0xFF);
-			cached_steamid[1] = (uint8_t)((time_id >> 8) & 0xFF);
-			cached_steamid[2] = (uint8_t)((time_id >> 16) & 0xFF);
-			cached_steamid[3] = (uint8_t)((time_id >> 24) & 0xFF);
-		}
-		
-		uint16_t time_part = (uint16_t)(Sys_DoubleTime() * 1000.0) & 0xFFFF;
-		cached_steamid[4] = (uint8_t)(time_part & 0xFF);
-		cached_steamid[5] = (uint8_t)((time_part >> 8) & 0xFF);
-		
-		uint16_t checksum = 0;
-		for (int i = 0; i < 6; i++) {
-			checksum += cached_steamid[i];
-		}
-		cached_steamid[6] = (uint8_t)(checksum & 0xFF);
-		cached_steamid[7] = (uint8_t)((checksum >> 8) & 0xFF);
-		
-		initialized = true;
-	}
-	
-	memcpy( steamid, cached_steamid, 8 );
+{
+    static qboolean initialized = false;
+    static uint8_t cached_steamid[8];
+    uint16_t time_part;
+    uint16_t checksum;
+    int i;
+
+    if (!initialized)
+    {
+        const char *id_md5 = ID_GetMD5();
+        uint32_t crc;
+
+        if (id_md5 && id_md5[0])
+        {
+            CRC32_Init( &crc );
+            CRC32_ProcessBuffer( &crc, id_md5, Q_strlen( id_md5 ));
+            crc = CRC32_Final( crc );
+
+            cached_steamid[0] = (uint8_t)(crc & 0xFF);
+            cached_steamid[1] = (uint8_t)((crc >> 8) & 0xFF);
+            cached_steamid[2] = (uint8_t)((crc >> 16) & 0xFF);
+            cached_steamid[3] = (uint8_t)((crc >> 24) & 0xFF);
+        }
+        else
+        {
+            uint32_t time_id = (uint32_t)(Sys_DoubleTime() * 1000.0);
+            cached_steamid[0] = (uint8_t)(time_id & 0xFF);
+            cached_steamid[1] = (uint8_t)((time_id >> 8) & 0xFF);
+            cached_steamid[2] = (uint8_t)((time_id >> 16) & 0xFF);
+            cached_steamid[3] = (uint8_t)((time_id >> 24) & 0xFF);
+        }
+
+        time_part = (uint16_t)(Sys_DoubleTime() * 1000.0) & 0xFFFF;
+        cached_steamid[4] = (uint8_t)(time_part & 0xFF);
+        cached_steamid[5] = (uint8_t)((time_part >> 8) & 0xFF);
+
+        checksum = 0;
+        for (i = 0; i < 6; i++) {
+            checksum += cached_steamid[i];
+        }
+        cached_steamid[6] = (uint8_t)(checksum & 0xFF);
+        cached_steamid[7] = (uint8_t)((checksum >> 8) & 0xFF);
+
+        initialized = true;
+    }
+
+    memcpy( steamid, cached_steamid, 8 );
 }
 
 /*
@@ -997,6 +1012,7 @@ void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames )
 {
 	const int playernum = ent - 1;
 	int samples = 0;
+	int ofs = 0;
 
 	if( voice.goldsrc )
 	{
@@ -1009,7 +1025,6 @@ void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames )
 		if( playernum < 0 || playernum >= cl.maxclients || !voice.decoders[playernum] )
 			return;
 
-		int ofs = 0;
 		// decode frame by frame
 		for( ;; )
 		{
