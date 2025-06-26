@@ -2015,29 +2015,35 @@ void CL_ParseVoiceData( sizebuf_t *msg, connprotocol_t proto )
 
 	idx = MSG_ReadByte( msg ) + 1;
 
+	if ( idx <= 0 || idx > cl.maxclients )
+		return;
+
 	if( proto == PROTO_GOLDSRC )
 	{
 		size = MSG_ReadShort( msg );
-		MSG_SeekToBit( msg, size << 3, SEEK_CUR ); // skip the entire buf, not supported yet
-
-#if 0 // shall we notify client.dll if nothing can be heard?
-		// must notify through as both local player and normal client
-		if( idx == cl.playernum + 1 )
-			Voice_StatusAck( &voice.local, VOICE_LOOPBACK_INDEX );
-
-		Voice_StatusAck( &voice.players_status[idx], idx );
-#endif
-		return;
+		if ( size > 4096 )
+		{
+			Con_Printf( S_ERROR "Voice data size is too large: %d bytes (max: %d)\n", size, VOICE_MAX_GS_DATA_SIZE );
+			return;
+		}
+	}
+	else
+	{
+		frames = MSG_ReadByte( msg );
+		size = MSG_ReadShort( msg );
+		if (size > 8192 )
+		{
+			Con_Printf( S_ERROR "Voice data size is too large: %d bytes (max: %d)\n", size, VOICE_MAX_DATA_SIZE );
+			return;
+		}
 	}
 
-	frames = MSG_ReadByte( msg );
-	size = MSG_ReadShort( msg );
 	size = Q_min( size, sizeof( received ));
 
-	MSG_ReadBytes( msg, received, size );
-
-	if ( idx <= 0 || idx > cl.maxclients )
+	if ( !size )
 		return;
+
+	MSG_ReadBytes( msg, received, size );
 
 	// must notify through as both local player and normal client
 	if( idx == cl.playernum + 1 )
@@ -2045,8 +2051,6 @@ void CL_ParseVoiceData( sizebuf_t *msg, connprotocol_t proto )
 
 	Voice_StatusAck( &voice.players_status[idx], idx );
 
-	if ( !size )
-		return;
 
 	Voice_AddIncomingData( idx, received, size, frames );
 }

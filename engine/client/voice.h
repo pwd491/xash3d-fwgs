@@ -20,6 +20,7 @@ GNU General Public License for more details.
 #include "common.h"
 #include "protocol.h" // MAX_CLIENTS
 #include "sound.h"
+#include <opus.h>
 
 typedef struct OpusCustomEncoder OpusCustomEncoder;
 typedef struct OpusCustomDecoder OpusCustomDecoder;
@@ -29,6 +30,8 @@ typedef struct OpusCustomMode OpusCustomMode;
 #define VOICE_LOCALCLIENT_INDEX (-1)
 
 #define VOICE_PCM_CHANNELS 1 // always mono
+#define VOICE_MAX_DATA_SIZE 8192
+#define VOICE_MAX_GS_DATA_SIZE 4096
 
 // never change these parameters when using opuscustom
 #define VOICE_OPUS_CUSTOM_SAMPLERATE 44100
@@ -40,16 +43,42 @@ typedef struct OpusCustomMode OpusCustomMode;
 // a1ba: do not change, we don't have any re-encoding support now
 #define VOICE_DEFAULT_CODEC VOICE_OPUS_CUSTOM_CODEC
 
+// GoldSrc voice configuration
+#define GS_MAX_DECOMPRESSED_SAMPLES 32768
+#define GS_DEFAULT_SAMPLE_RATE 24000
+#define GS_DEFAULT_FRAME_SIZE 480
+
+// VPC (Voice Packet Control) types
+enum gs_vpc_type {
+    GS_VPC_VDATA_SILENCE  = 0,
+    GS_VPC_VDATA_MILES 	  = 1,
+	GS_VPC_VDATA_SPEEX    = 2,
+	GS_VPC_VDATA_RAW      = 3,
+	GS_VPC_VDATA_SILK     = 4,
+    GS_VPC_VDATA_OPUS_PLC = 6,
+    GS_VPC_SETSAMPLERATE  = 11,
+    GS_VPC_UNKNOWN        = 10
+};
+
 typedef struct voice_status_s
 {
 	qboolean talking_ack;
 	double talking_timeout;
 } voice_status_t;
 
+typedef struct voice_autogain_s
+{
+	int   block_size;
+	float current_gain;
+	float next_gain;
+	float gain_multiplier;
+} voice_autogain_t;
+
 typedef struct voice_state_s
 {
 	string codec;
 	int quality;
+	qboolean goldsrc;
 
 	qboolean initialized;
 	qboolean is_recording;
@@ -63,6 +92,9 @@ typedef struct voice_state_s
 	OpusCustomMode    *custom_mode;
 	OpusCustomEncoder *encoder;
 	OpusCustomDecoder *decoders[MAX_CLIENTS];
+
+	OpusEncoder *gs_encoder;
+	OpusDecoder *gs_decoders[MAX_CLIENTS];
 
 	// audio info
 	uint width;
@@ -79,19 +111,12 @@ typedef struct voice_state_s
 	wavdata_t *input_file;
 	fs_offset_t input_file_pos; // in bytes
 
-	// automatic gain control
-	struct {
-		int block_size;
-		float current_gain;
-		float next_gain;
-		float gain_multiplier;
-	} autogain;
+	voice_autogain_t autogain;
 } voice_state_t;
 
 extern voice_state_t voice;
 
 void CL_AddVoiceToDatagram( void );
-
 void Voice_RegisterCvars( void );
 qboolean Voice_Init( const char *pszCodecName, int quality, qboolean preinit );
 void Voice_Idle( double frametime );
@@ -101,5 +126,10 @@ void Voice_RecordStart( void );
 void Voice_Disconnect( void );
 void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames );
 void Voice_StatusAck( voice_status_t *status, int playerIndex );
+
+qboolean Voice_IsGoldSrcMode( const char *codec );
+qboolean Voice_IsOpusCustomMode( const char *codec );
+int Voice_GetBitrateForQuality( int quality, qboolean goldsrc );
+void Voice_GenerateSteamID( uint8_t *steamid );
 
 #endif // VOICE_H
