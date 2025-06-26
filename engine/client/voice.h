@@ -134,6 +134,5 @@ void Voice_StatusAck( voice_status_t *status, int playerIndex );
 qboolean Voice_IsGoldSrcMode( const char *codec );
 qboolean Voice_IsOpusCustomMode( const char *codec );
 int Voice_GetBitrateForQuality( int quality, qboolean goldsrc );
-void Voice_GenerateSteamID( uint8_t *steamid );
 
 #endif // VOICE_H

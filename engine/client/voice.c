@@ -732,8 +732,12 @@ static uint Voice_CreateGSVoicePacket( byte *out, const byte *voice_data, uint v
 		return 0;
 	}
 
-	// FIXME
-	Voice_GenerateSteamID( out + offset );
+	if ( cls.steamid ) {
+		memcpy(out + offset, cls.steamid, 8);
+	} else {
+		memset(out + offset, 0, 8); // fallback: 0
+	}
+
 	offset += 8;
 
 	out[offset] = GS_VPC_SETSAMPLERATE;
@@ -758,63 +762,6 @@ static uint Voice_CreateGSVoicePacket( byte *out, const byte *voice_data, uint v
 	offset += 4;
 
 	return offset;
-}
-
-/*
-=========================
-Voice_GenerateSteamID
-
-Generate a unique SteamID for voice packets
-=========================
-*/
-void Voice_GenerateSteamID( uint8_t *steamid )
-{
-    static qboolean initialized = false;
-    static uint8_t cached_steamid[8];
-    uint16_t time_part;
-    uint16_t checksum;
-    int i;
-
-    if (!initialized)
-    {
-        const char *id_md5 = ID_GetMD5();
-        uint32_t crc;
-
-        if (id_md5 && id_md5[0])
-        {
-            CRC32_Init( &crc );
-            CRC32_ProcessBuffer( &crc, id_md5, Q_strlen( id_md5 ));
-            crc = CRC32_Final( crc );
-
-            cached_steamid[0] = (uint8_t)(crc & 0xFF);
-            cached_steamid[1] = (uint8_t)((crc >> 8) & 0xFF);
-            cached_steamid[2] = (uint8_t)((crc >> 16) & 0xFF);
-            cached_steamid[3] = (uint8_t)((crc >> 24) & 0xFF);
-        }
-        else
-        {
-            uint32_t time_id = (uint32_t)(Sys_DoubleTime() * 1000.0);
-            cached_steamid[0] = (uint8_t)(time_id & 0xFF);
-            cached_steamid[1] = (uint8_t)((time_id >> 8) & 0xFF);
-            cached_steamid[2] = (uint8_t)((time_id >> 16) & 0xFF);
-            cached_steamid[3] = (uint8_t)((time_id >> 24) & 0xFF);
-        }
-
-        time_part = (uint16_t)(Sys_DoubleTime() * 1000.0) & 0xFFFF;
-        cached_steamid[4] = (uint8_t)(time_part & 0xFF);
-        cached_steamid[5] = (uint8_t)((time_part >> 8) & 0xFF);
-
-        checksum = 0;
-        for (i = 0; i < 6; i++) {
-            checksum += cached_steamid[i];
-        }
-        cached_steamid[6] = (uint8_t)(checksum & 0xFF);
-        cached_steamid[7] = (uint8_t)((checksum >> 8) & 0xFF);
-
-        initialized = true;
-    }
-
-    memcpy( steamid, cached_steamid, 8 );
 }
 
 /*
