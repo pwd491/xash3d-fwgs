@@ -31,7 +31,7 @@ SDL_BUILD_PACKAGES[amd64]="libasound2-dev libpulse-dev \
 	libaudio-dev libjack-dev libsndio-dev libsamplerate0-dev libx11-dev libxext-dev \
 	libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libwayland-dev \
 	libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
-	libegl1-mesa-dev libdbus-1-dev libudev-dev"
+	libegl1-mesa-dev libdbus-1-dev libudev-dev libopus-dev libopusfile-dev"
 SDL_BUILD_PACKAGES[i386]="${SDL_BUILD_PACKAGES[amd64]//-dev/-dev:i386} libjack0:i386" # test
 SDL_BUILD_PACKAGES[arm64]=${SDL_BUILD_PACKAGES[amd64]//-dev/-dev:arm64}
 SDL_BUILD_PACKAGES[armhf]=${SDL_BUILD_PACKAGES[amd64]//-dev/-dev:armhf}
