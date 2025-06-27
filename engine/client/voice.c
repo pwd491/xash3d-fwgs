@@ -130,7 +130,7 @@ static qboolean Voice_InitCustomMode( void )
 {
 	int err = 0;
 
-	voice.width = sizeof( opus_int16 );
+	voice.width = sizeof( int16_t );
 	voice.samplerate = VOICE_OPUS_CUSTOM_SAMPLERATE;
 	voice.frame_size = VOICE_OPUS_CUSTOM_FRAME_SIZE;
 
@@ -302,7 +302,7 @@ static qboolean Voice_InitGoldSrcMode( int quality )
 {
 	voice.goldsrc = true;
 	voice.autogain.block_size = 128;
-	voice.width = sizeof( opus_int16 );
+	voice.width = sizeof( int16_t );
 	voice.samplerate = GS_DEFAULT_SAMPLE_RATE;
 	voice.frame_size = GS_DEFAULT_FRAME_SIZE;
 
@@ -334,7 +334,7 @@ static qboolean Voice_InitOpusCustomMode( int quality )
 	voice.autogain.block_size = 128;
 	voice.samplerate = VOICE_OPUS_CUSTOM_SAMPLERATE;
 	voice.frame_size = VOICE_OPUS_CUSTOM_FRAME_SIZE;
-	voice.width = sizeof( opus_int16 );
+	voice.width = sizeof( int16_t );
 
 	if( !Voice_InitCustomMode() || !Voice_InitOpusDecoder() )
 	{
@@ -472,9 +472,9 @@ static uint Voice_GetOpusCompressedData( byte *out, uint maxsize, uint *frames )
 		int bytes;
 
 		if( !voice.input_file )
-			Voice_ApplyGainAdjust((opus_int16*)(voice.input_buffer + ofs), voice.frame_size, voice_transmit_scale.value);
+			Voice_ApplyGainAdjust((int16_t*)(voice.input_buffer + ofs), voice.frame_size, voice_transmit_scale.value);
 
-		bytes = opus_custom_encode( voice.encoder, (const opus_int16 *)( voice.input_buffer + ofs ),
+		bytes = opus_custom_encode( voice.encoder, (const int16_t *)( voice.input_buffer + ofs ),
 			voice.frame_size, out + size + sizeof( uint16_t ), maxsize );
 
 		if( bytes > 0 )
@@ -687,7 +687,7 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
                 return 0;
             }
             decoded = opus_decode(decoder, data + offset + opus_offset, frame_size,
-                pcm + output_samples, GS_MAX_DECOMPRESSED_SAMPLES - output_samples, 0);
+                pcm + output_samples, GS_DEFAULT_FRAME_SIZE, 0);
             if (decoded < 0) {
                 Con_Printf( S_WARN "Opus decode error: %s\n", opus_strerror(decoded) );
                 return 0;
@@ -961,6 +961,15 @@ void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames )
 	int samples = 0;
 	int ofs = 0;
 
+	if( !voice.initialized || !voice_enable.value )
+		return;
+
+	// must notify through as both local player and normal client
+	if( ent + 1 == cl.playernum + 1 )
+		Voice_StatusAck( &voice.local, VOICE_LOOPBACK_INDEX );
+
+	Voice_StatusAck( &voice.players_status[ent], ent );
+
 	if( voice.goldsrc )
 	{
 		// Voice_ProcessGSData handles Voice_StartChannel internally
@@ -990,7 +999,7 @@ void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames )
 				break;
 
 			frame_samples = opus_custom_decode( voice.decoders[playernum], data + ofs, compressed_size,
-				(opus_int16*)voice.decompress_buffer + samples, voice.frame_size );
+				(int16_t*)voice.decompress_buffer + samples, voice.frame_size );
 
 			ofs += compressed_size;
 			samples += frame_samples;
@@ -1031,9 +1040,7 @@ void CL_AddVoiceToDatagram( void )
 
 			if ( voice_loopback.value && packet_size > 0 && frames > 0 )
 			{
-				// owww, loopback...
-				Voice_StatusAck( &voice.local, cl.playernum + 1 );
-				Voice_AddIncomingData( 1, voice.compress_buffer, packet_size, frames );
+				Voice_AddIncomingData( cl.playernum + 1, voice.compress_buffer, packet_size, frames );
 			}
 		}
 		return;
