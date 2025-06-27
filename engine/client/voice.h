@@ -20,15 +20,12 @@ GNU General Public License for more details.
 #include "common.h"
 #include "protocol.h" // MAX_CLIENTS
 #include "sound.h"
-#if defined(_WIN32) || defined(_WIN64) || defined(__APPLE__) || defined(__ANDROID__) || defined(__PSVITA__)
-#include <opus.h>
-#else
-#include <opus/opus.h>
-#endif
 
 typedef struct OpusCustomEncoder OpusCustomEncoder;
 typedef struct OpusCustomDecoder OpusCustomDecoder;
 typedef struct OpusCustomMode OpusCustomMode;
+typedef struct OpusEncoder OpusEncoder;
+typedef struct OpusDecoder OpusDecoder;
 
 #define VOICE_LOOPBACK_INDEX (-2)
 #define VOICE_LOCALCLIENT_INDEX (-1)

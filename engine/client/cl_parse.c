@@ -2010,7 +2010,7 @@ CL_ParseVoiceData
 */
 void CL_ParseVoiceData( sizebuf_t *msg, connprotocol_t proto )
 {
-	int size, idx, frames;
+	int size, idx, frames = 0;
 	byte received[8192];
 
 	idx = MSG_ReadByte( msg ) + 1;
@@ -2044,13 +2044,6 @@ void CL_ParseVoiceData( sizebuf_t *msg, connprotocol_t proto )
 		return;
 
 	MSG_ReadBytes( msg, received, size );
-
-	// must notify through as both local player and normal client
-	if( idx == cl.playernum + 1 )
-		Voice_StatusAck( &voice.local, VOICE_LOOPBACK_INDEX );
-
-	Voice_StatusAck( &voice.players_status[idx], idx );
-
 
 	Voice_AddIncomingData( idx, received, size, frames );
 }
