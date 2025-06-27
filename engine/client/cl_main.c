@@ -24,7 +24,6 @@ GNU General Public License for more details.
 #include "vid_common.h"
 #include "pm_local.h"
 #include "multi_emulator.h"
-#include "byteorder.h"
 
 #define MAX_CMD_BUFFER        8000
 #define CL_CONNECTION_TIMEOUT 15.0f
@@ -1034,8 +1033,8 @@ static void CL_WriteSteamTicket( sizebuf_t *send )
 	// RevEmu2013: pTicket[1] = revHash (low), pTicket[5] = 0x01100001 (high)
 	uint32_t low = ((uint32_t*)buf)[1];
 	uint32_t high = ((uint32_t*)buf)[5];
-	write_le32(cls.steamid, low);
-	write_le32(cls.steamid + 4, high);
+	*(uint32_t*)cls.steamid = LittleLong(low);
+	*(uint32_t*)(cls.steamid + 4) = LittleLong(high);
 }
 
 /*

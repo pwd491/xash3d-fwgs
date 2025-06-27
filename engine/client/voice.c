@@ -20,7 +20,6 @@ GNU General Public License for more details.
 #include "client.h"
 #include "voice.h"
 #include "crclib.h"
-#include "byteorder.h"
 
 voice_state_t voice = { 0 };
 
@@ -481,7 +480,7 @@ static uint Voice_GetOpusCompressedData( byte *out, uint maxsize, uint *frames )
 		if( bytes > 0 )
 		{
 			// write compressed frame size
-			*((uint16_t *)&out[size]) = bytes;
+			*((uint16_t *)&out[size]) = LittleShort(bytes);
 
 			size += bytes + sizeof( uint16_t );
 			maxsize -= bytes + sizeof( uint16_t );
@@ -570,8 +569,8 @@ static uint Voice_GetGSCompressedData( byte *out, uint maxsize, uint *frames )
 
         if( bytes > 0 )
         {
-            write_le16( out + size, bytes );
-            write_le16( out + size + 2, sequence++ );
+            *(uint16_t*)(out + size) = LittleShort(bytes);
+            *(uint16_t*)(out + size + 2) = LittleShort(sequence++);
 
             size += bytes + 4;
             maxsize -= bytes + 4;
@@ -620,11 +619,12 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
     size_t opus_offset;
     int decoded;
     size_t silence_samples;
+    uint16_t frame_size;
 
     if (!data || size < 18 || size < 4 || ent <= 0 || ent > cl.maxclients)
         return 0;
 
-    crc_in_packet = read_le32(data + size - 4);
+    crc_in_packet = LittleLong(*(uint32_t*)(data + size - 4));
     crc = CRC32_INIT_VALUE;
     CRC32_ProcessBuffer(&crc, data, size - 4);
     crc = CRC32_Final(crc);
@@ -646,11 +646,11 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
     if (offset + 4 > size - 4)
         return 0;
 
-    sample_rate = read_le16(data + offset);
+    sample_rate = LittleShort(*(uint16_t*)(data + offset));
     offset += 2;
 
     vpc_type = data[offset++];
-    data_len = read_le16(data + offset);
+    data_len = LittleShort(*(uint16_t*)(data + offset));
     offset += 2;
 
     if (offset + data_len > size - 4) {
@@ -666,7 +666,7 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
         }
         opus_offset = 0;
         while (opus_offset + 4 <= data_len) {
-            uint16_t frame_size = read_le16(data + offset + opus_offset);
+            frame_size = LittleShort(*(uint16_t*)(data + offset + opus_offset));
             opus_offset += 4;
 
             if (frame_size == 0) {
@@ -743,13 +743,13 @@ static uint Voice_CreateGSVoicePacket( byte *out, const byte *voice_data, uint v
 	out[offset] = GS_VPC_SETSAMPLERATE;
 	offset += 1;
 
-	write_le16( out + offset, GS_DEFAULT_SAMPLE_RATE );
+	*(uint16_t*)(out + offset) = LittleShort(GS_DEFAULT_SAMPLE_RATE);
 	offset += 2;
 
 	out[offset] = GS_VPC_VDATA_OPUS_PLC;
 	offset += 1;
 
-	write_le16( out + offset, voice_size );
+	*(uint16_t*)(out + offset) = LittleShort(voice_size);
 	offset += 2;
 
 	memcpy( out + offset, voice_data, voice_size );
@@ -758,7 +758,7 @@ static uint Voice_CreateGSVoicePacket( byte *out, const byte *voice_data, uint v
 	crc = CRC32_INIT_VALUE;
 	CRC32_ProcessBuffer( &crc, out, offset );
 	crc = CRC32_Final( crc );
-	write_le32( out + offset, crc );
+	*(uint32_t*)(out + offset) = LittleLong(crc);
 	offset += 4;
 
 	return offset;
