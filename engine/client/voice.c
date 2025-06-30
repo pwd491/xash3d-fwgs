@@ -16,6 +16,8 @@ GNU General Public License for more details.
 
 #define CUSTOM_MODES 1 // required to correctly link with Opus Custom
 #include <opus_custom.h>
+#include <opus.h>
+#include <SKP_Silk_SDK_API.h>
 #include "common.h"
 #include "client.h"
 #include "voice.h"
@@ -44,6 +46,8 @@ static void Voice_StartChannel( uint samples, byte *data, int entnum );
 static void Voice_Status( int entindex, qboolean bTalking );
 static void Voice_StatusTimeout( voice_status_t *status, int entindex, double frametime );
 static void Voice_Shutdown( void );
+static qboolean Voice_InitSilkDecoders(void);
+static void Voice_ShutdownSilkDecoders(void);
 
 /*
 ===============================================================================
@@ -312,6 +316,12 @@ static qboolean Voice_InitGoldSrcMode( int quality )
 		return false;
 	}
 
+	if( !Voice_InitSilkDecoders() )
+	{
+		Con_Printf( S_ERROR "Can't create Silk decoders, voice chat is disabled.\n" );
+		return false;
+	}
+
 	if( !Voice_InitOpusEncoder( quality ) )
 	{
 		Con_Printf( S_WARN "Other players will not be able to hear you.\n" );
@@ -362,6 +372,7 @@ static void Voice_ShutdownGoldSrcMode( void )
 {
 	Voice_ShutdownOpusDecoder();
 	Voice_ShutdownOpusEncoder();
+	Voice_ShutdownSilkDecoders();
 }
 
 /*
@@ -694,6 +705,50 @@ static int Voice_ProcessGSData( int ent, const uint8_t *data, uint32_t size )
             }
             output_samples += decoded;
             opus_offset += frame_size;
+        }
+    } else if (vpc_type == GS_VPC_VDATA_SILK) {
+        void *decoder;
+        SKP_SILK_SDK_DecControlStruct decControl;
+        size_t silk_offset;
+        SKP_int16 nSamplesOut;
+        int ret;
+        decoder = voice.silk_decoders[ent];
+        if (!decoder) {
+            Con_Printf( S_WARN "No Silk decoder available for entity %d\n", ent );
+            return 0;
+        }
+        decControl = (SKP_SILK_SDK_DecControlStruct){0};
+        decControl.API_sampleRate = SILK_DEFAULT_SAMPLE_RATE;
+        silk_offset = 0;
+        output_samples = 0;
+        while (silk_offset + 2 <= data_len) {
+            uint16_t payload_size = *(uint16_t *)(data + offset + silk_offset);
+            silk_offset += 2;
+            if (payload_size == 0) {
+                memset(pcm + output_samples, 0, SILK_DEFAULT_FRAME_SIZE * sizeof(int16_t));
+                output_samples += SILK_DEFAULT_FRAME_SIZE;
+                continue;
+            }
+            if (payload_size == 0xFFFF) {
+                SKP_Silk_SDK_InitDecoder(decoder);
+                break;
+            }
+            if (silk_offset + payload_size > data_len) {
+                Con_Printf(S_WARN "Silk payload size out of bounds\n");
+                return 0;
+            }
+            nSamplesOut = 0;
+            ret = SKP_Silk_SDK_Decode(
+                decoder, &decControl, 0,
+                data + offset + silk_offset, payload_size,
+                pcm + output_samples, &nSamplesOut
+            );
+            if (ret != 0) {
+                Con_Printf(S_WARN "Silk decode error: %d\n", ret);
+                return 0;
+            }
+            output_samples += nSamplesOut;
+            silk_offset += payload_size;
         }
     } else if (vpc_type == GS_VPC_VDATA_SILENCE) {
         silence_samples = data_len / 2;
@@ -1215,4 +1270,61 @@ qboolean Voice_Init( const char *pszCodecName, int quality, qboolean preinit )
 	
 	voice.initialized = true;
 	return true;
+}
+
+/*
+=========================
+Voice_InitSilkDecoders
+
+Initialize Silk decoders for clients
+=========================
+*/
+static qboolean Voice_InitSilkDecoders(void)
+{
+	int i;
+	int decSize = 0;
+	for (i = 0; i < cl.maxclients; ++i)
+	{
+		if (voice.silk_decoders[i])
+		{
+			SKP_Silk_SDK_InitDecoder(voice.silk_decoders[i]);
+			continue;
+		}
+		if (SKP_Silk_SDK_Get_Decoder_Size(&decSize) != 0)
+		{
+			Con_Printf(S_ERROR "Can't get Silk decoder size for %i\n", i);
+			return false;
+		}
+		voice.silk_decoders[i] = Mem_Malloc(host.soundpool, decSize);
+		if (!voice.silk_decoders[i])
+		{
+			Con_Printf(S_ERROR "Can't allocate Silk decoder for %i\n", i);
+			return false;
+		}
+		if (SKP_Silk_SDK_InitDecoder(voice.silk_decoders[i]) != 0)
+		{
+			Con_Printf(S_ERROR "Can't init Silk decoder for %i\n", i);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+=========================
+Voice_ShutdownSilkDecoders
+
+Cleanup Silk decoders
+=========================
+*/
+static void Voice_ShutdownSilkDecoders(void)
+{
+	for (int i = 0; i < MAX_CLIENTS; ++i)
+	{
+		if (voice.silk_decoders[i])
+		{
+			Mem_Free(voice.silk_decoders[i]);
+			voice.silk_decoders[i] = NULL;
+		}
+	}
 }
