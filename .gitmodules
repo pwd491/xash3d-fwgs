@@ -40,3 +40,6 @@
 [submodule "3rdparty/maintui"]
 	path = 3rdparty/maintui
 	url = https://github.com/numas13/xash3d-maintui.git
+[submodule "3rdparty/silk/silk"]
+	path = 3rdparty/silk/silk
+	url = https://github.com/pwd491/silk
