@@ -23,6 +23,38 @@
 // passed to pfnPlayerCustomization
 // For automatic downloading.
 
+// WAD3 structures for spray and texture parsing
+#define WAD3_SPRAY_TYPE  0x40
+#define WAD3_MIPTEX_TYPE 0x43
+
+typedef struct
+{
+	char identification[4]; // "WAD3"
+	int  numlumps;
+	int  infotableofs;
+} wad3header_t;
+
+typedef struct
+{
+	int  filepos;
+	int  disksize;
+	int  size; // uncompressed
+	char type;
+	char compression;
+	char pad1, pad2;
+	char name[16];
+} wad3lump_t;
+
+typedef struct
+{
+	char     texture_name[16];
+	uint32_t width;
+	uint32_t height;
+	uint32_t mip_offsets[4];
+	// ... mipmaps follow ...
+	// ... then short colors_used, then palette ...
+} miptex_t;
+
 typedef enum
 {
 	t_sound = 0,
