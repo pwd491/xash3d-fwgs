@@ -549,3 +549,231 @@ qboolean Image_LoadMIP( const char *name, const byte *buffer, fs_offset_t filesi
 
 	return Image_AddIndexedImageToPack( fin, image.width, image.height );
 }
+
+/*
+============
+Image_LoadWAD
+============
+*/
+qboolean Image_LoadWAD( const char *name, const byte *buffer, fs_offset_t filesize )
+{
+	const dwadinfo_t *hdr;
+	const dlumpinfo_t *lumps;
+	const unsigned char *raw = (const unsigned char *)buffer;
+	int i, j;
+
+	if( !raw || filesize < sizeof( dwadinfo_t ))
+		return false;
+
+	hdr = (const dwadinfo_t *)raw;
+	if( hdr->numlumps <= 0 || hdr->infotableofs <= 0 || hdr->infotableofs >= (int)filesize )
+		return false;
+
+	lumps = (const dlumpinfo_t *)(raw + hdr->infotableofs);
+
+	for( i = 0; i < hdr->numlumps; ++i )
+	{
+		if( lumps[i].type == TYP_MIPTEX || lumps[i].type == TYP_PALETTE )
+		{
+			const unsigned char *mipdata = raw + lumps[i].filepos;
+			int mip_size = lumps[i].disksize;
+			if( lumps[i].filepos < 0 || lumps[i].filepos + mip_size > (int)filesize )
+				continue;
+
+			mip_t mip;
+			memcpy( &mip, mipdata, sizeof( mip ));
+			uint32_t width = mip.width;
+			uint32_t height = mip.height;
+
+			if( width == 0 || height == 0 || width > 256 || height > 256 )
+				continue;
+
+			uint32_t offset0 = mip.offsets[0];
+			if( offset0 == 0 || offset0 + width * height > (uint32_t)mip_size )
+				continue;
+
+			const unsigned char *pixels = mipdata + offset0;
+			uint32_t m0size = width * height;
+			uint32_t m1size = m0size / 4;
+			uint32_t m2size = m0size / 16;
+			uint32_t m3size = m0size / 64;
+			const unsigned char *palette = mipdata + 0x28 + m0size + m1size + m2size + m3size + 2;
+
+			unsigned char grad_palette[256 * 3];
+			const unsigned char *use_palette = palette;
+			int alpha_mode = 0;
+			unsigned char frontR = 0, frontG = 0, frontB = 0;
+			float t;
+			byte idx;
+
+			if( lumps[i].type == TYP_PALETTE )
+			{
+				// gradient palette
+				const unsigned char *frontColorPtr = palette + 255 * 3;
+				frontR = frontColorPtr[0];
+				frontG = frontColorPtr[1];
+				frontB = frontColorPtr[2];
+				for( j = 0; j < 256; ++j )
+				{
+					t = j / 255.0f;
+					grad_palette[j * 3 + 0] = (unsigned char)( frontR * t );
+					grad_palette[j * 3 + 1] = (unsigned char)( frontG * t );
+					grad_palette[j * 3 + 2] = (unsigned char)( frontB * t );
+				}
+				use_palette = grad_palette;
+				alpha_mode = 1; // gradient
+			}
+
+			Image_Reset();
+			image.width = width;
+			image.height = height;
+			image.type = PF_RGBA_32;
+			image.flags = IMAGE_HAS_COLOR | IMAGE_HAS_ALPHA;
+			image.size = width * height * 4;
+			image.rgba = Mem_Malloc( host.imagepool, image.size );
+			image.palette = NULL;
+
+			for( j = 0; j < (int)(width * height); ++j )
+			{
+				idx = pixels[j];
+				image.rgba[j * 4 + 0] = use_palette[idx * 3 + 0];
+				image.rgba[j * 4 + 1] = use_palette[idx * 3 + 1];
+				image.rgba[j * 4 + 2] = use_palette[idx * 3 + 2];
+				if( alpha_mode == 1 )
+					image.rgba[j * 4 + 3] = idx; // soft transparency
+				else
+					image.rgba[j * 4 + 3] = ( idx == 255 ) ? 0 : 255; // classic
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+============
+Image_SaveWAD
+============
+*/
+qboolean Image_SaveWAD( const char *name, rgbdata_t *pix )
+{
+	int          mip0_size, mip1_size, mip2_size, mip3_size;
+	byte         *mip1_data = NULL, *mip2_data = NULL, *mip3_data = NULL;
+	file_t       *f;
+	dwadinfo_t   header;
+	mip_t        miptex;
+	long         palette_offset;
+	short        palette_size;
+	long         infotableofs;
+	dlumpinfo_t  lump;
+	int          infotableofs32;
+	fs_offset_t  pad;
+	byte         zero = 0;
+	int          i;
+	qboolean     result = false;
+	const byte  *palette;
+	int          lump_type = (pix->flags & IMAGE_GRADIENT_DECAL) ? TYP_PALETTE : TYP_MIPTEX;
+	byte         grad_palette[256 * 3];
+
+	if( !pix || !pix->buffer )
+		return false;
+
+	palette = pix->palette;
+	if( !palette )
+		palette = (const byte*)image.palette; // fallback to global palette
+
+	mip0_size = pix->width * pix->height;
+	mip1_size = mip0_size / 4;
+	mip2_size = mip0_size / 16;
+	mip3_size = mip0_size / 64;
+
+	mip1_data = (byte *)Mem_Malloc( host.imagepool, mip1_size );
+	mip2_data = (byte *)Mem_Malloc( host.imagepool, mip2_size );
+	mip3_data = (byte *)Mem_Malloc( host.imagepool, mip3_size );
+	if( !mip1_data || !mip2_data || !mip3_data )
+		goto cleanup;
+
+	Image_GenerateMipmaps( pix->buffer, pix->width, pix->height, mip1_data, mip2_data, mip3_data );
+
+	memset( &miptex, 0, sizeof( mip_t ));
+	Q_strncpy( miptex.name, "{LOGO", sizeof( miptex.name ));
+	miptex.width = pix->width;
+	miptex.height = pix->height;
+	miptex.offsets[0] = sizeof( mip_t );
+	miptex.offsets[1] = miptex.offsets[0] + mip0_size;
+	miptex.offsets[2] = miptex.offsets[1] + mip1_size;
+	miptex.offsets[3] = miptex.offsets[2] + mip2_size;
+
+	f = FS_Open( name, "wb", false );
+	if( !f )
+		goto cleanup;
+
+	memset( &header, 0, sizeof( header ));
+	header.ident = IDWAD3HEADER;
+	header.numlumps = 1;
+
+	palette_offset = miptex.offsets[3] + mip3_size;
+	palette_size = 256;
+
+	FS_Write( f, &header, sizeof( header ));
+	FS_Write( f, &miptex, sizeof( mip_t ));
+	FS_Write( f, pix->buffer, mip0_size );
+	FS_Write( f, mip1_data, mip1_size );
+	FS_Write( f, mip2_data, mip2_size );
+	FS_Write( f, mip3_data, mip3_size );
+	FS_Write( f, &palette_size, sizeof( short ));
+
+	if( lump_type == TYP_PALETTE )
+	{
+		// gradient palette
+		const byte *frontColorPtr = palette + 255 * 3;
+		byte frontR = frontColorPtr[0];
+		byte frontG = frontColorPtr[1];
+		byte frontB = frontColorPtr[2];
+		for( i = 0; i < 256; ++i )
+		{
+			float t = i / 255.0f;
+			grad_palette[i * 3 + 0] = (byte)( frontR * t );
+			grad_palette[i * 3 + 1] = (byte)( frontG * t );
+			grad_palette[i * 3 + 2] = (byte)( frontB * t );
+		}
+		FS_Write( f, grad_palette, 256 * 3 );
+	}
+	else
+	{
+		FS_Write( f, palette, 256 * 3 );
+	}
+
+	// padding up to a multiple of 4
+	pad = (( FS_Tell( f ) + 3 ) & ~3 ) - FS_Tell( f );
+	for( i = 0; i < pad; ++i )
+	{
+		FS_Write( f, &zero, 1 );
+	}
+
+	infotableofs = FS_Tell( f );
+	memset( &lump, 0, sizeof( lump ));
+	lump.filepos = sizeof( dwadinfo_t );
+	lump.disksize = (int)( palette_offset + sizeof( short ) + 256 * 3 );
+	lump.size = lump.disksize;
+	lump.type = (char)lump_type;
+	lump.attribs = 0;
+	Q_strncpy( lump.name, "tempdecal", sizeof( lump.name ));
+	FS_Write( f, &lump, sizeof( lump ));
+
+	FS_Seek( f, offsetof( dwadinfo_t, infotableofs ), SEEK_SET );
+	infotableofs32 = (int)infotableofs;
+	FS_Write( f, &infotableofs32, sizeof( int ));
+
+	FS_Close( f );
+	result = true;
+
+cleanup:
+	if( mip1_data )
+		Mem_Free( mip1_data );
+	if( mip2_data )
+		Mem_Free( mip2_data );
+	if( mip3_data )
+		Mem_Free( mip3_data );
+	return result;
+}
