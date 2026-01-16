@@ -2,6 +2,7 @@
 net_http.c - HTTP client implementation
 Copyright (C) 2024 mittorn
 Copyright (C) 2024 Alibek Omarov
+Copyright (C) 2026 Sergey Degtyar @pwd491
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -20,6 +21,7 @@ GNU General Public License for more details.
 #include "xash3d_mathlib.h"
 #include "ipv6text.h"
 #include "net_ws_private.h"
+#include "net_http_ssl.h"
 #include "miniz.h"
 
 /*
@@ -37,6 +39,7 @@ typedef struct httpserver_s
 	char host[256];
 	int port;
 	char path[MAX_SYSPATH];
+	qboolean is_https;
 	struct httpserver_s *next;
 } httpserver_t;
 
@@ -72,6 +75,9 @@ typedef struct httpfile_s
 	// query or response
 	char buf[MAX_HTTP_BUFFER_SIZE+1];
 	int header_size, query_length, bytes_sent;
+	
+	// SSL/TLS transport
+	http_transport_t transport;
 } httpfile_t;
 
 static struct http_static_s
@@ -100,6 +106,7 @@ static int HTTP_FileQueue( httpfile_t *file );
 static int HTTP_FileResolveNS( httpfile_t *file );
 static int HTTP_FileSendRequest( httpfile_t *file );
 static int HTTP_FileDecompress( httpfile_t *file );
+void HTTP_TestHTTPS_f( void );
 
 /*
 ==============
@@ -124,8 +131,15 @@ static void HTTP_FreeFile( httpfile_t *file, qboolean error )
 
 	file->file = NULL;
 
-	if( file->socket != -1 )
+	// Close transport (handles both HTTP and HTTPS)
+	if( file->transport.close )
 	{
+		HTTP_SSL_TransportClose( &file->transport );
+		http.active_count--;
+	}
+	else if( file->socket != -1 )
+	{
+		// Fallback: close socket directly if transport wasn't initialized
 		closesocket( file->socket );
 		http.active_count--;
 	}
@@ -250,7 +264,6 @@ static int HTTP_FileResolveNS( httpfile_t *file )
 static int HTTP_FileCreateSocket( httpfile_t *file )
 {
 	uint mode = 1;
-	int res;
 
 	file->socket = socket( file->addr.ss_family, SOCK_STREAM, IPPROTO_TCP );
 
@@ -269,6 +282,7 @@ static int HTTP_FileCreateSocket( httpfile_t *file )
 	}
 
 #if XASH_LINUX
+	int res;
 
 	res = fcntl( file->socket, F_GETFL, 0 );
 
@@ -289,6 +303,19 @@ static int HTTP_FileCreateSocket( httpfile_t *file )
 #endif
 
 	http.active_count++;
+	
+	// initialize transport
+	if( file->server->is_https )
+	{
+		// SSL transport will be initialized after TCP connect
+		// for now, just mark socket as created
+	}
+	else
+	{
+		// plain HTTP: initialize transport immediately
+		HTTP_SSL_TransportInit( &file->transport, file->socket );
+	}
+	
 	file->pfn_process = HTTP_FileConnect;
 	return 1;
 }
@@ -310,10 +337,52 @@ static int HTTP_FileConnect( httpfile_t *file )
 		case WSAEWOULDBLOCK:
 		case WSAEINPROGRESS:
 		case WSAEALREADY:
-			// add to the timeout
-			file->blocktime += host.frametime;
-			file->blockreason = "request send";
-			return 0;
+			// connection in progress, check if it's complete
+			{
+				fd_set writefds, exceptfds;
+				struct timeval timeout;
+				FD_ZERO( &writefds );
+				FD_ZERO( &exceptfds );
+				FD_SET( file->socket, &writefds );
+				FD_SET( file->socket, &exceptfds );
+				timeout.tv_sec = 0;
+				timeout.tv_usec = 0;
+				
+				if( select( file->socket + 1, NULL, &writefds, &exceptfds, &timeout ) > 0 )
+				{
+					// Check for errors first
+					if( FD_ISSET( file->socket, &exceptfds ))
+					{
+						Con_Printf( S_ERROR "cannot connect to server: connection error\n" );
+						HTTP_FreeFile( file, true );
+						return 0;
+					}
+					
+					// Connection is ready
+					if( FD_ISSET( file->socket, &writefds ))
+					{
+						// Verify connection succeeded
+						int so_error = 0;
+						socklen_t len = sizeof( so_error );
+						if( getsockopt( file->socket, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len ) == 0 && so_error == 0 )
+						{
+							// Connection successful
+							break;
+						}
+						else
+						{
+							Con_Printf( S_ERROR "cannot connect to server: connection failed\n" );
+							HTTP_FreeFile( file, true );
+							return 0;
+						}
+					}
+				}
+				
+				// still connecting, wait for next frame
+				file->blocktime += host.frametime;
+				file->blockreason = "connecting";
+				return 0;
+			}
 		default:
 			// error, exit
 			Con_Printf( S_ERROR "cannot connect to server: %s\n", NET_ErrorString( ));
@@ -323,6 +392,91 @@ static int HTTP_FileConnect( httpfile_t *file )
 	}
 
 	file->blocktime = 0;
+
+	// for HTTPS, initialize SSL transport and perform handshake
+	if( file->server->is_https )
+	{
+		// first, check if the SSL transport is already initialized.
+		// it might be if HTTP_FileConnect is called multiple times due to non-blocking behavior.
+		if( !file->transport.is_ssl_initialized )
+		{
+			qboolean ssl_ret = HTTP_SSL_TransportInitSSL( &file->transport, file->socket, file->server->host );
+			if( !ssl_ret )
+			{
+				Con_Printf( S_ERROR "HTTPS: Failed to initialize SSL transport: %d\n", ssl_ret );
+				HTTP_FreeFile( file, true );
+				return 0;
+			}
+			file->transport.is_ssl_initialized = true; // Mark as initialized
+		}
+
+		// Perform SSL handshake
+		int handshake_ret = HTTP_SSL_TransportConnect( &file->transport );
+		if( handshake_ret < 0 )
+		{
+			// handle non-blocking handshake states
+			if( handshake_ret == MBEDTLS_ERR_SSL_WANT_READ || handshake_ret == MBEDTLS_ERR_SSL_WANT_WRITE )
+			{
+				file->blocktime += host.frametime;
+				file->blockreason = "SSL handshake";
+				return 0; // handshake in progress, wait for next frame
+			}
+			else
+			{
+				// log original error from mbedTLS
+				Con_Printf( S_ERROR "HTTPS: SSL handshake returned: %d\n", handshake_ret );
+
+				// existing detailed error logging (from previous fixes)
+				if( handshake_ret == MBEDTLS_ERR_SSL_CONN_EOF || handshake_ret == -29312 )
+				{
+					Con_Printf( S_ERROR "HTTPS: Connection closed during handshake (EOF). Possible causes:\n" );
+					Con_Printf( S_ERROR "  - Server closed connection (may reject our handshake)\n" );
+					Con_Printf( S_ERROR "  - Network issue or timeout\n" );
+					Con_Printf( S_ERROR "  - Socket not properly connected before handshake\n" );
+					Con_Printf( S_ERROR "  - Non-blocking socket issue\n" );
+				}
+				else if( handshake_ret == MBEDTLS_ERR_RSA_VERIFY_FAILED || handshake_ret == -17280 )
+				{
+					Con_Printf( S_ERROR "HTTPS: Server signature verification failed during handshake.\n" );
+					Con_Printf( S_ERROR "HTTPS: This is a security-critical failure - the server\'s signature\n" );
+					Con_Printf( S_ERROR "HTTPS: could not be verified using its certificate. Possible causes:\n" );
+					Con_Printf( S_ERROR "  - Server certificate/key mismatch\n" );
+					Con_Printf( S_ERROR "  - Server misconfiguration\n" );
+					Con_Printf( S_ERROR "  - mbedTLS configuration issue (RSA verification)\n" );
+					Con_Printf( S_ERROR "  - Possible RSA-PSS vs RSA-PKCS1 format mismatch\n" );
+					Con_Printf( S_ERROR "HTTPS: Connection cannot proceed for security reasons.\n" );
+					Con_Printf( S_ERROR "HTTPS: This may be a known mbedTLS issue - check mbedTLS version and config.\n" );
+				}
+				else if( handshake_ret == MBEDTLS_ERR_SSL_INVALID_RECORD || handshake_ret == -29184 )
+				{
+					Con_Printf( S_ERROR "HTTPS: SSL handshake failed: An invalid SSL record was received.\n" );
+					Con_Printf( S_ERROR "HTTPS: This often indicates a protocol mismatch or non-SSL data on an SSL port.\n" );
+					Con_Printf( S_ERROR "HTTPS: Check server configuration or URL scheme (https:// vs http://).\n" );
+				}
+				else
+				{
+					Con_Printf( S_ERROR "HTTPS: SSL handshake failed: %s (code %d)\n", HTTP_SSL_ErrorToString( handshake_ret ), handshake_ret );
+				}
+
+				Con_Printf( S_ERROR "HTTPS: Socket fd=%d, net_ctx.fd=%d\n", file->socket, file->transport.net_ctx.fd );
+				HTTP_FreeFile( file, true );
+				return 0;
+			}
+		}
+
+		// handshake successful
+		file->blocktime = 0;
+		file->transport.is_ssl_established = true;
+	}
+	else
+	{
+		// Plain HTTP: transport already initialized in HTTP_FileCreateSocket
+		// just ensure it\'s initialized (should be, but check anyway)
+		if( !file->transport.read )
+		{
+			HTTP_SSL_TransportInit( &file->transport, file->socket );
+		}
+	}
 
 	if( !COM_CheckStringEmpty( http_useragent.string ) || !Q_strcmp( http_useragent.string, "xash3d" ))
 	{
@@ -350,10 +504,18 @@ static int HTTP_FileConnect( httpfile_t *file )
 static int HTTP_FileSendRequest( httpfile_t *file )
 {
 	int res = -1;
+	int remaining = file->query_length - file->bytes_sent;
 
-	res = send( file->socket, file->buf + file->bytes_sent, file->query_length - file->bytes_sent, 0 );
+	if( !file->transport.write )
+	{
+		Con_Printf( S_ERROR "HTTPS: Transport not initialized\n" );
+		HTTP_FreeFile( file, true );
+		return 0;
+	}
 
-	if( res >= 0 )
+	res = HTTP_SSL_TransportWrite( &file->transport, file->buf + file->bytes_sent, remaining );
+
+	if( res > 0 )
 	{
 		file->bytes_sent += res;
 		file->blocktime = 0;
@@ -369,18 +531,18 @@ static int HTTP_FileSendRequest( httpfile_t *file )
 			return 1;
 		}
 	}
-	else
+	else if( res == 0 )
 	{
-		int err = WSAGetLastError();
-		if( err != WSAEWOULDBLOCK && err != WSAENOTCONN )
-		{
-			Con_Printf( S_ERROR "failed to send request: %s\n", NET_ErrorString( ));
-			HTTP_FreeFile( file, true );
-			return 0;
-		}
-
+		// would block, need to retry
 		file->blocktime += host.frametime;
 		file->blockreason = "request send";
+	}
+	else
+	{
+		// error
+		Con_Printf( S_ERROR "failed to send request: %s\n", NET_ErrorString( ));
+		HTTP_FreeFile( file, true );
+		return 0;
 	}
 
 	return 0;
@@ -701,7 +863,15 @@ static int HTTP_FileProcessStream( httpfile_t *curfile )
 	int res;
 
 	// if we got there, we are receiving data
-	while(( res = recv( curfile->socket, buf, sizeof( buf ) - curfile->header_size - 1, 0 )) > 0 )
+	// transport.read() instead of recv() to support both HTTP and HTTPS
+	if( !curfile->transport.read )
+	{
+		Con_Printf( S_ERROR "HTTPS: Transport not initialized\n" );
+		HTTP_FreeFile( curfile, true );
+		return 0;
+	}
+
+	while(( res = HTTP_SSL_TransportRead( &curfile->transport, buf, sizeof( buf ) - curfile->header_size - 1 )) > 0 )
 	{
 		curfile->blocktime = 0;
 
@@ -998,20 +1168,45 @@ static httpserver_t *HTTP_ParseURL( const char *url )
 {
 	httpserver_t *server;
 	int i;
+	const char *http_prefix = NULL;
+	const char *https_prefix = NULL;
+	int prefix_len = 0;
 
-	url = Q_strstr( url, "http://" );
+	// check for https:// first, then http://
+	https_prefix = Q_strstr( url, "https://" );
+	http_prefix = Q_strstr( url, "http://" );
 
-	if( !url )
+	if( https_prefix )
+	{
+		url = https_prefix;
+		prefix_len = 8; // "https://"
+		server = Z_Calloc( sizeof( httpserver_t ));
+		server->is_https = true;
+		server->port = 443;
+	}
+	else if( http_prefix )
+	{
+		url = http_prefix;
+		prefix_len = 7; // "http://"
+		server = Z_Calloc( sizeof( httpserver_t ));
+		server->is_https = false;
+		server->port = 80;
+	}
+	else
+	{
 		return NULL;
+	}
 
-	url += 7;
-	server = Z_Calloc( sizeof( httpserver_t ));
+	url += prefix_len;
 	i = 0;
 
 	while( *url && ( *url != ':' ) && ( *url != '/' ) && ( *url != '\r' ) && ( *url != '\n' ))
 	{
-		if( i > sizeof( server->host ))
+		if( i >= sizeof( server->host ) - 1 )
+		{
+			Mem_Free( server );
 			return NULL;
+		}
 
 		server->host[i++] = *url++;
 	}
@@ -1025,8 +1220,6 @@ static httpserver_t *HTTP_ParseURL( const char *url )
 		while( *url && ( *url != '/' ) && ( *url != '\r' ) && ( *url != '\n' ))
 			url++;
 	}
-	else
-		server->port = 80;
 
 	i = 0;
 
@@ -1160,8 +1353,10 @@ static void HTTP_List_f( void )
 			httpserver_t *server;
 			for( server = file->server; server; server = server->next )
 			{
-				Con_Printf( "\thttp://%s:%d/%s%s\n", file->server->host, file->server->port,
-					file->server->path, file->path );
+				Con_Printf( "\t%s://%s:%d/%s%s\n", 
+					server->is_https ? "https" : "http",
+					server->host, server->port,
+					server->path, file->path );
 			}
 		}
 	}
@@ -1191,18 +1386,137 @@ void HTTP_Init( void )
 {
 	http.first_file = NULL;
 
+	// initialize SSL/TLS subsystem
+	HTTP_SSL_Init();
+
 	Cmd_AddRestrictedCommand( "http_download", HTTP_Download_f, "add file to download queue" );
 	Cmd_AddRestrictedCommand( "http_skip", HTTP_Skip_f, "skip current download server" );
 	Cmd_AddRestrictedCommand( "http_cancel", HTTP_Cancel_f, "cancel current download" );
 	Cmd_AddRestrictedCommand( "http_clear", HTTP_Clear_f, "cancel all downloads" );
 	Cmd_AddRestrictedCommand( "http_list", HTTP_List_f, "list all queued downloads" );
 	Cmd_AddCommand( "http_addcustomserver", HTTP_AddCustomServer_f, "add custom fastdl server");
+	Cmd_AddRestrictedCommand( "https_test", HTTP_TestHTTPS_f, "test HTTPS connection (for debugging)" );
 
 	Cvar_RegisterVariable( &http_useragent );
 	Cvar_RegisterVariable( &http_autoremove );
 	Cvar_RegisterVariable( &http_timeout );
 	Cvar_RegisterVariable( &http_maxconnections );
 	Cvar_RegisterVariable( &http_show_headers );
+}
+
+/*
+====================
+HTTP_TestHTTPS_f
+
+Test HTTPS connection (for debugging)
+Usage: https_test <url>
+====================
+*/
+void HTTP_TestHTTPS_f( void )
+{
+	const char *url;
+	httpserver_t *server;
+	httpfile_t *file;
+	
+	if( Cmd_Argc() < 2 )
+	{
+		Con_Printf( S_USAGE "https_test <url>\n" );
+		Con_Printf( "Example: https_test https://example.com/robots.txt\n" );
+		return;
+	}
+
+	url = Cmd_Argv( 1 );
+	
+	// parse URL
+	server = HTTP_ParseURL( url );
+	if( !server )
+	{
+		Con_Printf( S_ERROR "Invalid URL: %s\n", url );
+		Con_Printf( "URL must start with http:// or https://\n" );
+		return;
+	}
+
+	if( !server->is_https )
+	{
+		Con_Printf( S_WARN "URL is not HTTPS, but will test anyway: %s\n", url );
+	}
+
+	// HTTP_ParseURL puts the full path in server->path (e.g., "/s20/ajawad.wad/")
+	// but HTTP_FileConnect uses server->path + file->path for the request
+	// so we need to split: server->path should be the base path, file->path should be the filename
+	
+	// extract the filename from server->path
+	// server->path is like "/s20/ajawad.wad/" - we need to split it
+	const char *server_path = server->path;
+	int path_len = Q_strlen( server_path );
+	
+	// remove trailing '/' if present
+	char temp_path[MAX_SYSPATH];
+	Q_strncpy( temp_path, server_path, sizeof( temp_path ));
+	if( path_len > 0 && temp_path[path_len - 1] == '/' )
+	{
+		temp_path[path_len - 1] = '\0';
+		path_len--;
+	}
+	
+	if( path_len == 0 || path_len == 1 ) // only "/" or empty
+	{
+		Con_Printf( S_ERROR "HTTPS Test: No file path in URL\n" );
+		Mem_Free( server );
+		return;
+	}
+	
+	// find the last slash (now we know there's no trailing slash)
+	const char *last_slash = Q_strrchr( temp_path, '/' );
+	
+	if( !last_slash )
+	{
+		Con_Printf( S_ERROR "HTTPS Test: Invalid path in URL\n" );
+		Mem_Free( server );
+		return;
+	}
+	
+	// extract filename (after last slash)
+	const char *filename_start = last_slash + 1;
+	int filename_len = Q_strlen( filename_start );
+	
+	if( filename_len == 0 )
+	{
+		Con_Printf( S_ERROR "HTTPS Test: No filename in URL\n" );
+		Mem_Free( server );
+		return;
+	}
+	
+	// extract base path (everything up to and including last slash)
+	int base_path_len = last_slash - temp_path + 1;
+	char base_path[MAX_SYSPATH];
+	Q_strncpy( base_path, temp_path, base_path_len + 1 );
+	base_path[base_path_len] = '\0';
+	
+	// extract filename
+	char file_path[MAX_SYSPATH];
+	Q_strncpy( file_path, filename_start, sizeof( file_path ));
+	
+	// update server->path to be the base path only
+	Q_strncpy( server->path, base_path, sizeof( server->path ));
+
+	Con_Printf( "HTTPS Test: Connecting to %s:%d%s%s (file: %s)\n", 
+		server->host, server->port, server->path, 
+		server->is_https ? " (HTTPS)" : " (HTTP)", file_path );
+
+	// create a test file entry
+	file = Z_Calloc( sizeof( httpfile_t ));
+	file->server = server;
+	Q_strncpy( file->path, file_path, sizeof( file->path ));
+	file->socket = -1;
+	file->pfn_process = HTTP_FileQueue;
+
+	// add to queue
+	file->next = http.first_file;
+	http.first_file = file;
+
+	Con_Printf( "HTTPS Test: Added to download queue. Use 'http_list' to check status.\n" );
+	Con_Printf( "HTTPS Test: The download will proceed automatically.\n" );
 }
 
 /*
@@ -1221,4 +1535,7 @@ void HTTP_Shutdown( void )
 		http.first_server = http.first_server->next;
 		Mem_Free( tmp );
 	}
+
+	// shutdown SSL/TLS subsystem
+	HTTP_SSL_Shutdown();
 }
