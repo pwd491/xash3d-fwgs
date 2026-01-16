@@ -1,0 +1,175 @@
+#! /usr/bin/env python
+# encoding: utf-8
+
+import os
+
+def options(opt):
+	pass
+
+def configure(conf):
+	if not conf.path.find_dir('mbedtls') or not conf.path.find_dir('mbedtls/library'):
+		conf.fatal('Can\'t find mbedtls submodule. Run `git submodule update --init --recursive`.')
+		return
+
+	conf.check(header_name='string.h', mandatory=True)
+	conf.check(header_name='stdlib.h', mandatory=True)
+	conf.check(header_name='stdint.h', mandatory=True)
+
+def build(bld):
+	# create a patched config file that disables PSA
+	# the config file defines MBEDTLS_PSA_CRYPTO_C unconditionally, which causes
+	# linker errors when PSA source files are excluded. We need to comment it out.
+	config_dir = bld.path.find_dir('mbedtls/include/mbedtls')
+	if config_dir:
+		config_file = config_dir.find_node('mbedtls_config.h')
+		if config_file:
+			config_content = config_file.read()
+			# disable PSA crypto
+			config_content = config_content.replace(
+				'#define MBEDTLS_PSA_CRYPTO_C',
+				'//#define MBEDTLS_PSA_CRYPTO_C  // Disabled by xash3d build'
+			)
+			config_content = config_content.replace(
+				'#define MBEDTLS_PSA_CRYPTO_STORAGE_C',
+				'//#define MBEDTLS_PSA_CRYPTO_STORAGE_C  // Disabled by xash3d build'
+			)
+			# disable TLS 1.3 (requires PSA)
+			config_content = config_content.replace(
+				'#define MBEDTLS_SSL_PROTO_TLS1_3',
+				'//#define MBEDTLS_SSL_PROTO_TLS1_3  // Disabled by xash3d build'
+			)
+			config_content = config_content.replace(
+				'#define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED',
+				'//#define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED  // Disabled by xash3d build'
+			)
+			config_content = config_content.replace(
+				'#define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL_ENABLED',
+				'//#define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL_ENABLED  // Disabled by xash3d build'
+			)
+			# disable LMS (requires PSA)
+			config_content = config_content.replace(
+				'#define MBEDTLS_LMS_C',
+				'//#define MBEDTLS_LMS_C  // Disabled by xash3d build'
+			)
+			# write patched config to build directory
+			patched_config_dir = bld.path.get_bld().make_node('3rdparty/mbedtls')
+			patched_config_dir.mkdir()
+			patched_config = patched_config_dir.make_node('mbedtls_config_patched.h')
+			patched_config.write(config_content)
+	
+	# get all source files from mbedtls/library
+	# mbedTLS uses conditional compilation based on defines, so we can include all files
+	# and disable unwanted features via configuration
+	sources = bld.path.ant_glob([
+		'mbedtls/library/*.c'
+	], excl = [
+		# exclude test/demo files
+		'mbedtls/library/*test*.c',
+		'mbedtls/library/*demo*.c',
+		'mbedtls/library/*example*.c',
+		# note: we include server files because some internal functions are needed
+		# even for client-only usage
+		# exclude DTLS (we only need TLS)
+		'mbedtls/library/ssl_dtls*.c',
+		# exclude TLS 1.3 files (require PSA crypto and we only need TLS 1.2)
+		'mbedtls/library/ssl_tls13*.c',
+		# exclude LMS (Leighton-Micali Signature) files (require PSA crypto)
+		'mbedtls/library/lms*.c',
+		'mbedtls/library/lmots*.c',
+		# exclude config file (auto-generated)
+		'mbedtls/library/mbedtls_config.c',
+		# exclude PSA crypto files (we use classic crypto API)
+		'mbedtls/library/psa_*.c',
+	])
+	
+	includes = [
+		bld.path.get_bld().abspath() + '/3rdparty/mbedtls',  # for patched config
+		'mbedtls/include',
+		'mbedtls',  # for tf-psa-crypto/build_info.h
+	]
+	
+	# configuration: use patched mbedTLS config file
+	# we'll customize it via defines to enable only what we need for HTTPS client
+	defines = [
+		# use patched config file that has PSA disabled
+		'MBEDTLS_CONFIG_FILE="mbedtls_config_patched.h"',
+		
+		# disable PSA (Platform Security Architecture) - use classic crypto API
+		# this avoids dependency on tf_psa_crypto_common.h
+		# note: do NOT define MBEDTLS_USE_PSA_CRYPTO at all (not even as 0)
+		# because #if defined(MBEDTLS_USE_PSA_CRYPTO) checks for existence, not value
+		# we exclude PSA source files to prevent PSA functions from being available
+		
+		# enable SSL/TLS client features
+		'MBEDTLS_SSL_TLS_C',
+		'MBEDTLS_SSL_CLI_C',
+		'MBEDTLS_SSL_PROTO_TLS1_2',
+		# keep peer certificate for signature verification
+		'MBEDTLS_SSL_KEEP_PEER_CERTIFICATE',
+		# disable TLS 1.3 to avoid PSA crypto requirement and compatibility issues
+		# 'MBEDTLS_SSL_PROTO_TLS1_3',
+		
+		# enable X.509 certificate parsing (required for HTTPS)
+		'MBEDTLS_X509_USE_C',
+		'MBEDTLS_X509_CRT_PARSE_C',
+		
+		# enable basic crypto needed for TLS (classic API, not PSA)
+		'MBEDTLS_PK_C',
+		'MBEDTLS_PK_PARSE_C',
+		'MBEDTLS_RSA_C',
+		# enable PKCS#1 for RSA signature verification
+		'MBEDTLS_PKCS1_V15',
+		'MBEDTLS_PKCS1_V21',
+		'MBEDTLS_X509_RSASSA_PSS_SUPPORT',
+		# enable ECDSA/ECDH for modern servers (like Google)
+		'MBEDTLS_ECP_C',
+		'MBEDTLS_ECDSA_C',
+		'MBEDTLS_ECDH_C',
+		'MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED', # enable ECDHE_RSA key exchange
+		# enable common elliptic curves (required for ECDSA/ECDH)
+		'MBEDTLS_ECP_DP_SECP256R1_ENABLED',
+		'MBEDTLS_ECP_DP_SECP384R1_ENABLED',
+		'MBEDTLS_ASN1_PARSE_C',
+		'MBEDTLS_ASN1_WRITE_C',
+		'MBEDTLS_BIGNUM_C',
+		'MBEDTLS_MD_C',
+		'MBEDTLS_SHA256_C',
+		'MBEDTLS_SHA512_C',
+		'MBEDTLS_CIPHER_C',
+		'MBEDTLS_AES_C',
+		'MBEDTLS_GCM_C',
+		'MBEDTLS_CCM_C',
+		
+		# entropy and RNG
+		'MBEDTLS_ENTROPY_C',
+		'MBEDTLS_CTR_DRBG_C',
+		
+		# platform support
+		'MBEDTLS_PLATFORM_C',
+		'MBEDTLS_ERROR_C',
+		'MBEDTLS_VERSION_C',
+		'MBEDTLS_OID_C',
+		'MBEDTLS_BASE64_C',
+		
+		# disable features we don't need to reduce size
+		# note: we need platform entropy for RNG, so don't disable it
+		# 'MBEDTLS_NO_PLATFORM_ENTROPY',  # keep platform entropy enabled
+		'MBEDTLS_SSL_MAX_CONTENT_LEN=16384',  # Limit buffer size
+	]
+	
+	# platform-specific settings
+	if bld.env.DEST_OS == 'win32':
+		# Windows: use CryptGenRandom for entropy
+		defines.append('MBEDTLS_ENTROPY_HARDWARE_ALT')
+	else:
+		# POSIX: use /dev/urandom (default in mbedTLS)
+		pass
+	
+	bld.stlib(
+		source = sources,
+		target = 'mbedtls',
+		features = 'c',
+		includes = includes,
+		defines = defines,
+		export_includes = ['mbedtls/include']
+	)

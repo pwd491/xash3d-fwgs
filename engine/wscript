@@ -187,6 +187,8 @@ def configure(conf):
 
 		conf.env.CURL=True
 		conf.define('HAVE_CURL', True)
+	else:
+		conf.define('XASH_HAVE_MBEDTLS', 1)
 
 	conf.define_cond('XASH_STATIC_LIBS', conf.env.STATIC_LINKING)
 	conf.define_cond('XASH_CUSTOM_SWAP', conf.options.CUSTOM_SWAP)
@@ -199,7 +201,7 @@ def build(bld):
 	# public includes for renderers and utils use
 	bld(name = 'engine_includes', export_includes = '. common common/imagelib', use = 'filesystem_includes')
 
-	libs = ['engine_includes', 'public', 'werror', 'backtrace', 'library_suffix']
+	libs = ['engine_includes', 'public', 'werror', 'backtrace', 'library_suffix', 'mbedtls']
 	includes = ['server', 'client', 'client/vgui', 'common/soundlib', 'platform']
 
 	# basic build: dedicated only
@@ -232,6 +234,7 @@ def build(bld):
 		libs += ['CURL']
 	else:
 		source += ['common/http/net_http_xash.c']
+		source += ['common/http/net_http_ssl.c']
 
 	if bld.env.DEST_OS == 'win32':
 		libs += ['USER32', 'SHELL32', 'GDI32', 'ADVAPI32', 'DBGHELP', 'PSAPI', 'WS2_32']
