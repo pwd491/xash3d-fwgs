@@ -209,15 +209,6 @@ static int HTTP_FileQueue( httpfile_t *file )
 	}
 
 	Con_Reportf( "HTTP: Starting download %s from %s:%d\n", file->path, file->server->host, file->server->port );
-	Q_snprintf( name, sizeof( name ), DEFAULT_DOWNLOADED_DIRECTORY "%s.incomplete", file->path );
-
-	if( !( file->file = FS_Open( name, "wb+", true )))
-	{
-		Con_Printf( S_ERROR "HTTP: cannot open %s!\n", name );
-		HTTP_FreeFile( file, true );
-		return 0;
-	}
-
 	file->pfn_process = HTTP_FileResolveNS;
 	file->blocktime = file->downloaded = file->lastchecksize = file->checktime = 0;
 	return 1;
@@ -973,7 +964,17 @@ static int HTTP_FileProcessStream( httpfile_t *curfile )
 					}
 
 					curfile->size = size;
+					curfile->reported_size = size;
 					curfile->header_size = 0;
+
+					char incname[MAX_SYSPATH + 64];
+					Q_snprintf( incname, sizeof( incname ), DEFAULT_DOWNLOADED_DIRECTORY "%s.incomplete", curfile->path );
+					if( !( curfile->file = FS_Open( incname, "wb+", true )))\
+					{
+						Con_Printf( S_ERROR "HTTP: cannot open %s!\n", incname );\
+						HTTP_FreeFile( curfile, true );
+						return 0;
+					}
 				}
 
 				if( curfile->size == -1 && !curfile->chunked )
