@@ -44,6 +44,10 @@ GNU General Public License for more details.
 #define SBRK_CONNECT_TIMEOUT		10.0
 #define SBRK_CONNECT_RETRY_DELAY	5.0
 #define SBRK_TICKET_SIZE_MAX 		2048
+#define SBRK_AVATAR_REQUEST_FMT		"sb_get_avatar %" PRIu64 " %d"
+#define SBRK_AVATAR_RESPONSE_HEADER	"sb_pavatar\n"
+#define SBRK_AVATAR_MAX_PNG_SIZE	( SBRK_MAX_FRAME_SIZE - 64 )
+#define SBRK_AVATAR_POLL_INTERVAL	2.0
 
 static CVAR_DEFINE_AUTO( cl_steam_broker_addr, "127.0.0.1:27420", FCVAR_PRIVILEGED|FCVAR_ARCHIVE, "address of steam broker instance" );
 
@@ -71,6 +75,27 @@ typedef struct
 } steam_broker_t;
 
 static steam_broker_t broker;
+
+typedef enum 
+{
+	SBRK_AVATAR_UNREQUESTED,
+	SBRK_AVATAR_PENDING,
+	SBRK_AVATAR_READY,
+	SBRK_AVATAR_UNAVAILABLE,
+} sbrk_avatar_state_t;
+
+typedef struct sbrk_avatar_s
+{
+	int width;
+	int height;
+	uint64_t steamid;
+	byte status;
+	byte data[SBRK_AVATAR_MAX_PNG_SIZE];
+	uint32_t data_len;
+	double request_time;
+} sbrk_avatar_t;
+
+static sbrk_avatar_t g_sbrk_avatars[32];
 
 static void SteamBroker_SetState( sbrk_state_t new_state )
 {
@@ -106,6 +131,14 @@ static void SteamBroker_Disconnect( void )
 {
 	SteamBroker_CloseSocket();
 	SteamBroker_SetState( SBRK_STATE_IDLE );
+
+	// any outstanding request will never be answered by this connection;
+	// drop pending state so avatars get re-requested after reconnect
+	for( int i = 0; i < 32; i++ )
+	{
+		if( g_sbrk_avatars[i].status == SBRK_AVATAR_PENDING )
+			memset( &g_sbrk_avatars[i], SBRK_AVATAR_UNREQUESTED, sizeof( g_sbrk_avatars[i] ));
+	}
 }
 
 static qboolean SteamBroker_ConnectImpl( void )
@@ -210,6 +243,45 @@ static qboolean SteamBroker_SendFrame( const char *payload, size_t payload_size 
 	return true;
 }
 
+static void SteamBroker_HandleAvatarResponse( uint64_t steamid, uint8_t variant, uint8_t status, sizebuf_t *sb, uint32_t data_len )
+{
+	sbrk_avatar_t *avatar = NULL;
+
+	for( int i = 0; i < 32; i++ )
+	{
+		if( g_sbrk_avatars[i].steamid == steamid )
+		{
+			avatar = &g_sbrk_avatars[i];
+			break;
+		}
+	}
+
+	if( !avatar )
+		return;
+	
+	if ( status == SBRK_AVATAR_PENDING )
+	{
+		avatar->status = SBRK_AVATAR_PENDING;
+		return;
+	}
+
+	if ( status == SBRK_AVATAR_UNAVAILABLE )
+	{
+		avatar->status = SBRK_AVATAR_UNAVAILABLE;
+		return;
+	}	
+
+	memcpy(
+		avatar->data,
+		MSG_GetData( sb ) + MSG_GetNumBytesRead( sb ),
+		data_len
+	);
+
+	avatar->steamid = steamid;
+	avatar->data_len = data_len;
+	avatar->status = SBRK_AVATAR_READY;
+}
+
 static qboolean SteamBroker_ProcessFrame( void )
 {
 	if( broker.rx_buffer_pos < SBRK_FRAME_HEADER_SIZE + SBRK_FRAME_LENGTH_SIZE )
@@ -237,40 +309,58 @@ static qboolean SteamBroker_ProcessFrame( void )
 		return false; // need more data
 
 	char response_header[SBRK_RESPONSE_HEADER_SIZE];
-	if( MSG_ReadBytes( &sb, response_header, sizeof( response_header ), SBRK_RESPONSE_HEADER_SIZE ))
+	if( !MSG_ReadBytes( &sb, response_header, sizeof( response_header ), SBRK_RESPONSE_HEADER_SIZE ) )
 	{
-		if( memcmp( response_header, SBRK_RESPONSE_HEADER, SBRK_RESPONSE_HEADER_SIZE ) == 0 )
+		Con_Printf( S_ERROR "%s: response too short for header\n", __func__ );
+	}	
+	else if( !memcmp( response_header, SBRK_RESPONSE_HEADER, SBRK_RESPONSE_HEADER_SIZE ) )
+	{ // sb_connect
+		int32_t challenge = MSG_ReadLong( &sb );
+		if( broker.challenge != challenge )
 		{
-			int32_t challenge = MSG_ReadLong( &sb );
-			if( broker.challenge != challenge )
+			Con_Printf( S_ERROR "%s: challenge mismatch\n", __func__ );
+		}
+		else
+		{
+			uint64_t steam_id;
+			MSG_ReadBytes( &sb, &steam_id, sizeof( steam_id ), sizeof( steam_id ));
+			uint32_t ticket_size = MSG_ReadDword( &sb );
+			uint8_t ticket_data[SBRK_TICKET_SIZE_MAX];
+
+			if( ticket_size > SBRK_TICKET_SIZE_MAX )
 			{
-				Con_Printf( S_ERROR "%s: challenge mismatch\n", __func__ );
+				Con_Printf( S_ERROR "%s: ticket size exceeds limit (%u)\n", __func__, ticket_size );
+			}
+			else if( MSG_ReadBytes( &sb, ticket_data, sizeof( ticket_data ), ticket_size ))
+			{
+				Con_Printf( "%s: SteamID: %"PRIu64", ticket: [%d, %d, %d, %d...]\n", __func__, steam_id, ticket_data[0], ticket_data[1], ticket_data[2], ticket_data[3] );
+
+				memcpy( cls.steamid, &steam_id, sizeof( cls.steamid ));
+				CL_SendGoldSrcConnectPacket( broker.serveradr, broker.challenge, ticket_data, ticket_size );
+				cls.broker_wait = false;
 			}
 			else
 			{
-				uint64_t steam_id;
-				MSG_ReadBytes( &sb, &steam_id, sizeof( steam_id ), sizeof( steam_id ));
-				uint32_t ticket_size = MSG_ReadDword( &sb );
-				uint8_t ticket_data[SBRK_TICKET_SIZE_MAX];
-
-				if( ticket_size > SBRK_TICKET_SIZE_MAX )
-				{
-					Con_Printf( S_ERROR "%s: ticket size exceeds limit (%u)\n", __func__, ticket_size );
-				}
-				else if( MSG_ReadBytes( &sb, ticket_data, sizeof( ticket_data ), ticket_size ))
-				{
-					Con_Printf( "%s: SteamID: %"PRIu64", ticket: [%d, %d, %d, %d...]\n", __func__, steam_id, ticket_data[0], ticket_data[1], ticket_data[2], ticket_data[3] );
-
-					memcpy( cls.steamid, &steam_id, sizeof( cls.steamid ));
-					CL_SendGoldSrcConnectPacket( broker.serveradr, broker.challenge, ticket_data, ticket_size );
-					cls.broker_wait = false;
-				}
-				else
-				{
-					Con_Printf( S_ERROR "%s: failed to read ticket data\n", __func__ );
-				}
+				Con_Printf( S_ERROR "%s: failed to read ticket data\n", __func__ );
 			}
 		}
+	}
+	else if( !memcmp( response_header, SBRK_AVATAR_RESPONSE_HEADER, SBRK_RESPONSE_HEADER_SIZE ))
+	{ // sb_pavatar
+		uint64_t steamid;
+		uint8_t variant, status;
+		uint32_t data_len;
+
+		MSG_ReadBytes( &sb, &steamid, sizeof( steamid ), sizeof( steamid ));
+		variant = MSG_ReadByte( &sb );
+		status = MSG_ReadByte( &sb );
+		data_len = MSG_ReadDword( &sb );
+
+		SteamBroker_HandleAvatarResponse( steamid, variant, status, &sb, data_len );
+	}
+	else
+	{
+		Con_Printf( S_ERROR "%s: unknown response header\n", __func__ );
 	}
 	
 	// remove processed frame from buffer
@@ -519,12 +609,115 @@ void SteamBroker_Frame( void )
 	}
 }
 
+static void SteamBroker_RequestAvatar( uint64_t steamid )
+{
+	char buf[64];
+	int len = Q_snprintf( buf, sizeof( buf ), SBRK_AVATAR_REQUEST_FMT, steamid, 0 );
+
+	if( len > 0 )
+		SteamBroker_SendFrame( buf, len );
+}
+
+/*
+ * SteamBroker_ReserveAvatarSlot
+ *
+ * Finds an existing slot for steamid, or reserves a free/stale one and
+ * marks it PENDING. Returns NULL only if no slot could be reserved (should
+ * not normally happen given a fixed steamid pool of live players).
+ * This must be called before SteamBroker_RequestAvatar so that the
+ * response has somewhere to land.
+ */
+static sbrk_avatar_t *SteamBroker_ReserveAvatarSlot( uint64_t steamid )
+{
+	sbrk_avatar_t *free_slot = NULL;
+	sbrk_avatar_t *oldest_slot = NULL;
+	double oldest_time = 0.0;
+
+	for( int i = 0; i < 32; i++ )
+	{
+		sbrk_avatar_t *slot = &g_sbrk_avatars[i];
+
+		if( slot->steamid == steamid )
+			return slot;
+
+		if( !free_slot && slot->status == SBRK_AVATAR_UNREQUESTED )
+			free_slot = slot;
+
+		if( slot->status != SBRK_AVATAR_PENDING &&
+			( !oldest_slot || slot->request_time < oldest_time ))
+		{
+			oldest_slot = slot;
+			oldest_time = slot->request_time;
+		}
+	}
+
+	sbrk_avatar_t *target = free_slot ? free_slot : oldest_slot;
+	if( !target )
+		return NULL; // all 32 slots are actively PENDING; caller should just retry later
+
+	memset( target, SBRK_AVATAR_UNREQUESTED, sizeof( *target ));
+	target->steamid = steamid;
+	target->status = SBRK_AVATAR_PENDING;
+	target->request_time = Platform_DoubleTime();
+	return target;
+}
+
+/*
+ * SteamBroker_GetAvatar
+ *
+ * Returns the avatar status:
+ *   1 - PENDING
+ *   2 - READY    (data/data_len contain PNG data)
+ *   3 - UNAVAILABLE
+ */
+int SteamBroker_GetAvatar( uint64_t steamid, byte **data, uint32_t *data_len )
+{
+	if( broker.state != SBRK_STATE_CONNECTED )
+		return SBRK_AVATAR_UNAVAILABLE;
+
+	for( int i = 0; i < 32; i++ )
+	{
+		if( g_sbrk_avatars[i].steamid != steamid )
+			continue;
+
+		if( g_sbrk_avatars[i].status == SBRK_AVATAR_READY )
+		{
+			*data = g_sbrk_avatars[i].data;
+			*data_len = g_sbrk_avatars[i].data_len;
+			return SBRK_AVATAR_READY;
+		}
+
+		if( g_sbrk_avatars[i].status == SBRK_AVATAR_UNAVAILABLE )
+			return SBRK_AVATAR_UNAVAILABLE;
+
+		if( g_sbrk_avatars[i].status == SBRK_AVATAR_PENDING )
+		{
+			if ( Platform_DoubleTime() - g_sbrk_avatars[i].request_time >= SBRK_AVATAR_POLL_INTERVAL )
+			{
+				SteamBroker_RequestAvatar( steamid );
+				g_sbrk_avatars[i].request_time = Platform_DoubleTime();
+			}	
+			return SBRK_AVATAR_PENDING;
+		}
+	}
+
+	// no existing slot: reserve one *before* sending the request, otherwise
+	// SteamBroker_HandleAvatarResponse has nowhere to store the reply
+	sbrk_avatar_t *slot = SteamBroker_ReserveAvatarSlot( steamid );
+	if( !slot )
+		return SBRK_AVATAR_PENDING; // pool exhausted this frame, try again later
+
+	SteamBroker_RequestAvatar( steamid );
+	return SBRK_AVATAR_PENDING;
+}
+
 void SteamBroker_Init( void )
 {
 	broker.state = SBRK_STATE_IDLE;
 	broker.socket = INVALID_SOCKET;
 	broker.rx_buffer_pos = 0;
 	broker.tx_buffer_pos = 0;
+	memset( &g_sbrk_avatars, 0, sizeof( g_sbrk_avatars ));
 	Cvar_RegisterVariable( &cl_steam_broker_addr );
 	NET_NetadrSetType( &broker.adr, NA_UNDEFINED );
 }

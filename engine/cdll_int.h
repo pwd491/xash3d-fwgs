@@ -306,6 +306,9 @@ typedef struct cl_enginefuncs_s
 
 	// added in 2019 update, not documented yet
 	int		(*pfnFilteredClientCmd)( const char *cmd );
+
+	// steam-broker stuff
+	int		(*pfnGetPlayerAvatar)( uint64_t steamid, byte **data, uint32_t *data_len );
 } cl_enginefunc_t;
 
 #define CLDLL_INTERFACE_VERSION	7

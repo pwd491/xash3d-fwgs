@@ -1211,6 +1211,7 @@ void CL_GetSecuredClientAPI( CL_EXPORT_FUNCS F );
 void SteamBroker_Init( void );
 void SteamBroker_Shutdown( void );
 void SteamBroker_Frame( void );
+int SteamBroker_GetAvatar( uint64_t steamid, byte **data, uint32_t *data_len );
 qboolean SteamBroker_InitiateGameConnection( netadr_t serveradr, int challenge );
 void SteamBroker_TerminateGameConnection( void );
 

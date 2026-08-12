@@ -1865,6 +1865,24 @@ static void GAME_EXPORT pfnGetPlayerInfo( int ent_num, hud_player_info_t *pinfo 
 	pinfo->packetloss = player->packet_loss;
 	pinfo->topcolor = player->topcolor;
 	pinfo->bottomcolor = player->bottomcolor;
+	pinfo->m_nSteamID = strtoull(Info_ValueForKey(player->userinfo, "*sid"), NULL, 10);
+}
+
+/*
+=============
+pfnGetPlayerAvatar
+
+Requests the Steam avatar for the specified SteamID.
+
+Returns:
+    1 - Pending: avatar request is still being processed.
+    2 - Ready: avatar data is available and returned through data/data_len.
+    3 - Unavailable: avatar data is not available for this SteamID.
+=============
+*/
+static int GAME_EXPORT pfnGetPlayerAvatar( uint64_t steamid, byte **data, uint32_t *data_len )
+{
+	return SteamBroker_GetAvatar( steamid, data, data_len );
 }
 
 /*
@@ -3879,7 +3897,8 @@ static cl_enginefunc_t gEngfuncs =
 	pfnGetAppID,
 	Cmd_AliasGetList,
 	pfnVguiWrap2_GetMouseDelta,
-	pfnFilteredClientCmd
+	pfnFilteredClientCmd,
+	pfnGetPlayerAvatar
 };
 
 void CL_UnloadProgs( void )
