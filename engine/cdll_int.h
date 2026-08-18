@@ -59,6 +59,31 @@ typedef struct SCREENINFO_s
 	short		charWidths[256];
 } SCREENINFO;
 
+typedef enum
+{
+	SBRK_PLAYER_UNREQUESTED,
+	SBRK_PLAYER_PENDING,
+	SBRK_PLAYER_READY,
+	SBRK_PLAYER_UNAVAILABLE,
+} sbrk_player_status_t;
+
+typedef struct
+{
+	uint64_t steamid;
+
+	char name[128];
+
+	byte relationship;
+	byte persona_state;
+	uint32_t game_app_id;
+	byte avatar_png[4096];
+	uint32_t avatar_png_size;
+	qboolean avatar_dirty;
+
+	sbrk_player_status_t status;
+	double request_time;
+} sbrk_player_info_t;
+
 typedef struct client_data_s
 {
 	// fields that cannot be modified  (ie. have no effect if changed)
@@ -306,6 +331,7 @@ typedef struct cl_enginefuncs_s
 
 	// added in 2019 update, not documented yet
 	int		(*pfnFilteredClientCmd)( const char *cmd );
+	int 	(*pfnGetPlayerSteamInfo)( uint64_t steamid, sbrk_player_info_t *player );
 } cl_enginefunc_t;
 
 #define CLDLL_INTERFACE_VERSION	7

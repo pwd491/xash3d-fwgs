@@ -1865,6 +1865,18 @@ static void GAME_EXPORT pfnGetPlayerInfo( int ent_num, hud_player_info_t *pinfo 
 	pinfo->packetloss = player->packet_loss;
 	pinfo->topcolor = player->topcolor;
 	pinfo->bottomcolor = player->bottomcolor;
+	pinfo->m_nSteamID = strtoull(Info_ValueForKey(player->userinfo, "*sid"), NULL, 10);
+}
+
+/*
+=============
+pfnGetPlayerSteamInfo
+
+=============
+*/
+static int GAME_EXPORT pfnGetPlayerSteamInfo( uint64_t steamid, sbrk_player_info_t *player )
+{
+	return SteamBroker_GetPlayerInfo( steamid, player );
 }
 
 /*
@@ -3879,7 +3891,8 @@ static cl_enginefunc_t gEngfuncs =
 	pfnGetAppID,
 	Cmd_AliasGetList,
 	pfnVguiWrap2_GetMouseDelta,
-	pfnFilteredClientCmd
+	pfnFilteredClientCmd,
+	pfnGetPlayerSteamInfo
 };
 
 void CL_UnloadProgs( void )

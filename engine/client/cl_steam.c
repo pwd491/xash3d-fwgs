@@ -45,6 +45,51 @@ GNU General Public License for more details.
 #define SBRK_CONNECT_RETRY_DELAY	5.0
 #define SBRK_TICKET_SIZE_MAX 		2048
 
+#define SBRK_PLAYER_REQUEST_FMT			"sb_get_player %" PRIu64
+#define SBRK_PLAYER_RESPONSE_HEADER		"sb_playerx\n"
+#define SBRK_PLAYER_RESPONSE_HEADER_SIZE	(sizeof(SBRK_PLAYER_RESPONSE_HEADER) - 1)
+
+#define SBRK_PLAYER_NAME_SIZE			128
+
+// A single avatar field can never exceed the max payload of the frame that
+// carries it, so this is a safe upper bound for the raw PNG buffer.
+#define SBRK_AVATAR_PNG_MAX			SBRK_MAX_FRAME_SIZE
+
+#define SBRK_PLAYER_POLL_INTERVAL		0.1
+#define SBRK_PLAYER_CACHE_SIZE			32
+
+#define SBRK_PLAYER_FIELD_NAME			(1u << 0)
+#define SBRK_PLAYER_FIELD_AVATAR_SMALL	(1u << 1)
+#define SBRK_PLAYER_FIELD_AVATAR_MEDIUM	(1u << 2)	// reserved, not sent by broker yet
+#define SBRK_PLAYER_FIELD_AVATAR_LARGE	(1u << 3)	// reserved, not sent by broker yet
+#define SBRK_PLAYER_FIELD_RELATIONSHIP	(1u << 4)
+#define SBRK_PLAYER_FIELD_COUNTRY		(1u << 5)	// reserved, not sent by broker yet
+#define SBRK_PLAYER_FIELD_GAME			(1u << 6)
+#define SBRK_PLAYER_FIELD_RICH_PRESENCE	(1u << 7)	// reserved, not sent by broker yet
+#define SBRK_PLAYER_FIELD_PERSONA_STATE	(1u << 8)
+
+typedef enum
+{
+	SBRK_PLAYER_FIELD_TYPE_NAME 			= 1,
+	SBRK_PLAYER_FIELD_TYPE_AVATAR_SMALL 	= 2,
+	SBRK_PLAYER_FIELD_TYPE_AVATAR_MEDIUM 	= 3, // reserved
+	SBRK_PLAYER_FIELD_TYPE_AVATAR_LARGE 	= 4, // reserved
+	SBRK_PLAYER_FIELD_TYPE_RELATIONSHIP 	= 5,
+	SBRK_PLAYER_FIELD_TYPE_COUNTRY 			= 6, // reserved
+	SBRK_PLAYER_FIELD_TYPE_GAME 			= 7,
+	SBRK_PLAYER_FIELD_TYPE_RICH_PRESENCE 	= 8, // reserved
+	SBRK_PLAYER_FIELD_TYPE_PERSONA_STATE 	= 9
+} sbrk_player_field_t;
+
+typedef enum
+{
+	SBRK_PLAYER_RELATIONSHIP_NONE                  = 0,
+	SBRK_PLAYER_RELATIONSHIP_FRIEND                = 1,
+	SBRK_PLAYER_RELATIONSHIP_BLOCKED               = 2,
+	SBRK_PLAYER_RELATIONSHIP_FRIENDSHIP_REQUESTED  = 3,
+	SBRK_PLAYER_RELATIONSHIP_REQUESTING_FRIENDSHIP = 4,
+} sbrk_player_relationship_t;
+
 static CVAR_DEFINE_AUTO( cl_steam_broker_addr, "127.0.0.1:27420", FCVAR_PRIVILEGED|FCVAR_ARCHIVE, "address of steam broker instance" );
 
 typedef enum
@@ -71,6 +116,7 @@ typedef struct
 } steam_broker_t;
 
 static steam_broker_t broker;
+static sbrk_player_info_t g_sbrk_player_cache[SBRK_PLAYER_CACHE_SIZE];
 
 static void SteamBroker_SetState( sbrk_state_t new_state )
 {
@@ -210,6 +256,272 @@ static qboolean SteamBroker_SendFrame( const char *payload, size_t payload_size 
 	return true;
 }
 
+static void SteamBroker_SendPlayerInfoRequest( uint64_t steamid )
+{
+	char buf[64];
+	int len = Q_snprintf( buf, sizeof( buf ), SBRK_PLAYER_REQUEST_FMT, steamid );
+
+	if( len > 0 )
+		SteamBroker_SendFrame( buf, len );
+}
+
+static sbrk_player_info_t *SteamBroker_FindPlayerSlot( uint64_t steamid )
+{
+	int i;
+
+	for( i = 0; i < SBRK_PLAYER_CACHE_SIZE; i++ )
+	{
+		if( g_sbrk_player_cache[i].steamid == steamid )
+			return &g_sbrk_player_cache[i];
+	}
+
+	return NULL;
+}
+
+// Precondition: caller has already verified no slot for `steamid` exists.
+// Picks a free slot if available, otherwise evicts the least-recently-
+// updated non-pending slot (LRU by request_time).
+static sbrk_player_info_t *SteamBroker_AllocatePlayerSlot( uint64_t steamid )
+{
+	sbrk_player_info_t *free_slot = NULL;
+	sbrk_player_info_t *oldest_slot = NULL;
+	sbrk_player_info_t *target;
+	double oldest_time = 0.0;
+	int i;
+
+	for( i = 0; i < SBRK_PLAYER_CACHE_SIZE; i++ )
+	{
+		sbrk_player_info_t *slot = &g_sbrk_player_cache[i];
+
+		if( !free_slot && slot->status == SBRK_PLAYER_UNREQUESTED )
+			free_slot = slot;
+
+		if( slot->status != SBRK_PLAYER_PENDING &&
+			( !oldest_slot || slot->request_time < oldest_time ))
+		{
+			oldest_slot = slot;
+			oldest_time = slot->request_time;
+		}
+	}
+
+	target = free_slot ? free_slot : oldest_slot;
+	if( !target )
+		return NULL; // cache full of in-flight requests, nothing evictable
+
+	memset( target, 0, sizeof( *target ));
+	target->steamid = steamid;
+	target->status = SBRK_PLAYER_PENDING;
+	target->request_time = Platform_DoubleTime();
+
+	return target;
+}
+
+int SteamBroker_GetPlayerInfo( uint64_t steamid, sbrk_player_info_t *out )
+{
+	sbrk_player_info_t *entry;
+
+	if( broker.state != SBRK_STATE_CONNECTED )
+		return SBRK_PLAYER_UNAVAILABLE;
+
+	if( steamid == 0 )
+		return SBRK_PLAYER_UNAVAILABLE; // 0 collides with the zero-initialized "free slot" marker
+
+	entry = SteamBroker_FindPlayerSlot( steamid );
+
+	if( !entry )
+	{
+		entry = SteamBroker_AllocatePlayerSlot( steamid );
+		if( !entry )
+			return SBRK_PLAYER_PENDING; // couldn't even start tracking it yet
+
+		SteamBroker_SendPlayerInfoRequest( steamid );
+		return SBRK_PLAYER_PENDING;
+	}
+
+	switch( entry->status )
+	{
+	case SBRK_PLAYER_READY:
+		if( out )
+			*out = *entry;
+		return SBRK_PLAYER_READY;
+
+	case SBRK_PLAYER_UNAVAILABLE:
+		return SBRK_PLAYER_UNAVAILABLE;
+
+	case SBRK_PLAYER_PENDING:
+		if( Platform_DoubleTime() - entry->request_time >= SBRK_PLAYER_POLL_INTERVAL )
+		{
+			SteamBroker_SendPlayerInfoRequest( steamid );
+			entry->request_time = Platform_DoubleTime();
+		}
+		return SBRK_PLAYER_PENDING;
+
+	case SBRK_PLAYER_UNREQUESTED:
+	default:
+		// Shouldn't happen in practice now that steamid==0 is rejected above,
+		// but handle defensively instead of falling through with no return.
+		entry->steamid = steamid;
+		entry->status = SBRK_PLAYER_PENDING;
+		entry->request_time = Platform_DoubleTime();
+		SteamBroker_SendPlayerInfoRequest( steamid );
+		return SBRK_PLAYER_PENDING;
+	}
+}
+
+// Parses an "sb_playerx" payload into the matching cache slot. `sb` must
+// already be positioned right after the common frame + response header
+// (SteamBroker_ProcessFrame consumes those bytes before dispatching here) —
+// this function does NOT re-read any header of its own.
+static void SteamBroker_ProcessPlayerResponse( sizebuf_t *sb )
+{
+	sbrk_player_info_t *player;
+	uint64_t steamid;
+
+	if( MSG_GetNumBytesLeft( sb ) < sizeof( uint64_t ) + sizeof( uint32_t ))
+		return;
+
+	MSG_ReadBytes( sb, &steamid, sizeof( steamid ), sizeof( steamid ));
+	MSG_ReadDword( sb ); // field flags: informational only, each field is self-delimited below
+
+	player = SteamBroker_FindPlayerSlot( steamid );
+
+	if( !player )
+	{
+		Con_Printf( S_WARN "%s: response for unknown SteamID %"PRIu64"\n", __func__, steamid );
+		return;
+	}
+
+	player->name[0] = '\0';
+	player->relationship = SBRK_PLAYER_RELATIONSHIP_NONE;
+	player->persona_state = 0;
+	player->game_app_id = 0;
+	// Note: avatar_png/avatar_png_size are intentionally NOT reset here.
+	// The broker only attaches the avatar field once it has finished
+	// fetching it from Steam, which may be a response or two after this
+	// one; resetting unconditionally would throw away an avatar we
+	// already received while we wait for nothing to change.
+
+	// Generic TLV walk: every field is `type(1) + length(4, LE) + data(length)`,
+	// with NO exceptions for fixed-size fields like relationship or persona
+	// state. Always consuming the length prefix (and using it to skip
+	// unknown or partially-understood fields) keeps the stream in sync even
+	// if a future broker adds field types this client doesn't know about yet.
+	while( MSG_GetNumBytesLeft( sb ) > 0 )
+	{
+		byte type;
+		uint32_t field_len;
+
+		if( MSG_GetNumBytesLeft( sb ) < 1 )
+			break;
+
+		type = MSG_ReadByte( sb );
+
+		if( MSG_GetNumBytesLeft( sb ) < sizeof( uint32_t ))
+			return;
+
+		field_len = MSG_ReadDword( sb );
+
+		if( MSG_GetNumBytesLeft( sb ) < field_len )
+			break;
+
+		switch( type )
+		{
+		case SBRK_PLAYER_FIELD_TYPE_NAME:
+			if( field_len >= sizeof( player->name ))
+			{
+				Con_Printf( S_WARN "%s: player name too long (%u)\n", __func__, field_len );
+				MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+				break;
+			}
+
+			MSG_ReadBytes( sb, player->name, sizeof( player->name ), field_len );
+			player->name[field_len] = '\0';
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_AVATAR_SMALL:
+			if( field_len > sizeof( player->avatar_png ))
+			{
+				Con_Printf( S_WARN "%s: avatar payload too large (%u)\n", __func__, field_len );
+				MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+				break;
+			}
+
+			MSG_ReadBytes( sb, player->avatar_png, sizeof( player->avatar_png ), field_len );
+			player->avatar_png_size = field_len;
+			player->avatar_dirty = true;
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_AVATAR_MEDIUM:
+		case SBRK_PLAYER_FIELD_TYPE_AVATAR_LARGE:
+			// reserved
+			MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_RELATIONSHIP:
+			if( field_len < 1 )
+			{
+				MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+				break;
+			}
+
+			player->relationship = MSG_ReadByte( sb );
+			if( field_len > 1 )
+				MSG_SeekToBit( sb, ( field_len - 1 ) << 3, SEEK_CUR );
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_COUNTRY:
+			// Reserved: broker doesn't send this field yet. Skipped via the
+			// length prefix rather than parsed, so it stays wire-compatible
+			// whenever it does get populated.
+			MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_GAME:
+			if( field_len < sizeof( uint32_t ))
+			{
+				MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+				break;
+			}
+
+			player->game_app_id = MSG_ReadDword( sb );
+			if( field_len > sizeof( uint32_t ))
+				MSG_SeekToBit( sb, ( field_len - sizeof( uint32_t )) << 3, SEEK_CUR );
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_RICH_PRESENCE:
+			// Reserved: same as country above.
+			MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+			break;
+
+		case SBRK_PLAYER_FIELD_TYPE_PERSONA_STATE:
+			if( field_len < 1 )
+			{
+				MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+				break;
+			}
+
+			player->persona_state = MSG_ReadByte( sb );
+			if( field_len > 1 )
+				MSG_SeekToBit( sb, ( field_len - 1 ) << 3, SEEK_CUR );
+			break;
+
+		default:
+			// Unknown field type: skip exactly `field_len` bytes instead of
+			// bailing out, so one field neither of us recognizes yet doesn't
+			// desync the rest of the payload.
+			Con_Printf( S_WARN "%s: unknown player field type %u, skipping %u bytes\n", __func__, type, field_len );
+			MSG_SeekToBit( sb, field_len << 3, SEEK_CUR );
+			break;
+		}
+	}
+
+	player->status = SBRK_PLAYER_READY;
+	player->request_time = Platform_DoubleTime();
+
+	Con_DPrintf( "%s: received player %"PRIu64" \"\n",
+		__func__, player->steamid );
+}
+
 static qboolean SteamBroker_ProcessFrame( void )
 {
 	if( broker.rx_buffer_pos < SBRK_FRAME_HEADER_SIZE + SBRK_FRAME_LENGTH_SIZE )
@@ -237,42 +549,56 @@ static qboolean SteamBroker_ProcessFrame( void )
 		return false; // need more data
 
 	char response_header[SBRK_RESPONSE_HEADER_SIZE];
-	if( MSG_ReadBytes( &sb, response_header, sizeof( response_header ), SBRK_RESPONSE_HEADER_SIZE ))
+
+	if( !MSG_ReadBytes( &sb, response_header, sizeof( response_header ), SBRK_RESPONSE_HEADER_SIZE ))
+		return false;
+
+	if( memcmp( response_header, SBRK_RESPONSE_HEADER, SBRK_RESPONSE_HEADER_SIZE ) == 0 )
 	{
-		if( memcmp( response_header, SBRK_RESPONSE_HEADER, SBRK_RESPONSE_HEADER_SIZE ) == 0 )
+		// sb_connect response
+
+		int32_t challenge = MSG_ReadLong( &sb );
+
+		if( broker.challenge != challenge )
 		{
-			int32_t challenge = MSG_ReadLong( &sb );
-			if( broker.challenge != challenge )
+			Con_Printf( S_ERROR "%s: challenge mismatch\n", __func__ );
+		}
+		else
+		{
+			uint64_t steam_id;
+			MSG_ReadBytes( &sb, &steam_id, sizeof( steam_id ), sizeof( steam_id ));
+			uint32_t ticket_size = MSG_ReadDword( &sb );
+			uint8_t ticket_data[SBRK_TICKET_SIZE_MAX];
+
+			if( ticket_size > SBRK_TICKET_SIZE_MAX )
 			{
-				Con_Printf( S_ERROR "%s: challenge mismatch\n", __func__ );
+				Con_Printf( S_ERROR "%s: ticket size exceeds limit (%u)\n", __func__, ticket_size );
+			}
+			else if( MSG_ReadBytes( &sb, ticket_data, sizeof( ticket_data ), ticket_size ))
+			{
+					Con_Printf( "%s: SteamID: %"PRIu64", ticket: [%d, %d, %d, %d...]\n", __func__, steam_id, ticket_data[0], ticket_data[1], ticket_data[2], ticket_data[3] );
+
+				memcpy( cls.steamid, &steam_id, sizeof( cls.steamid ));
+				CL_SendGoldSrcConnectPacket( broker.serveradr, broker.challenge, ticket_data, ticket_size );
+				cls.broker_wait = false;
 			}
 			else
 			{
-				uint64_t steam_id;
-				MSG_ReadBytes( &sb, &steam_id, sizeof( steam_id ), sizeof( steam_id ));
-				uint32_t ticket_size = MSG_ReadDword( &sb );
-				uint8_t ticket_data[SBRK_TICKET_SIZE_MAX];
-
-				if( ticket_size > SBRK_TICKET_SIZE_MAX )
-				{
-					Con_Printf( S_ERROR "%s: ticket size exceeds limit (%u)\n", __func__, ticket_size );
-				}
-				else if( MSG_ReadBytes( &sb, ticket_data, sizeof( ticket_data ), ticket_size ))
-				{
-					Con_Printf( "%s: SteamID: %"PRIu64", ticket: [%d, %d, %d, %d...]\n", __func__, steam_id, ticket_data[0], ticket_data[1], ticket_data[2], ticket_data[3] );
-
-					memcpy( cls.steamid, &steam_id, sizeof( cls.steamid ));
-					CL_SendGoldSrcConnectPacket( broker.serveradr, broker.challenge, ticket_data, ticket_size );
-					cls.broker_wait = false;
-				}
-				else
-				{
-					Con_Printf( S_ERROR "%s: failed to read ticket data\n", __func__ );
-				}
+				Con_Printf( S_ERROR "%s: failed to read ticket data\n", __func__ );
 			}
 		}
 	}
-	
+	else if( memcmp( response_header, SBRK_PLAYER_RESPONSE_HEADER, SBRK_PLAYER_RESPONSE_HEADER_SIZE ) == 0 )
+	{
+		// sb_playerx response — `sb` is already positioned right after the
+		// header we just verified above, so hand it off as-is.
+		SteamBroker_ProcessPlayerResponse( &sb );
+	}
+	else
+	{
+		Con_Printf( S_ERROR "%s: unknown response header\n", __func__ );
+	}
+
 	// remove processed frame from buffer
 	memmove( broker.rx_buffer, broker.rx_buffer + frame_size, broker.rx_buffer_pos - frame_size );
 	broker.rx_buffer_pos -= frame_size;
@@ -525,6 +851,7 @@ void SteamBroker_Init( void )
 	broker.socket = INVALID_SOCKET;
 	broker.rx_buffer_pos = 0;
 	broker.tx_buffer_pos = 0;
+	memset( g_sbrk_player_cache, 0, sizeof( g_sbrk_player_cache ));
 	Cvar_RegisterVariable( &cl_steam_broker_addr );
 	NET_NetadrSetType( &broker.adr, NA_UNDEFINED );
 }
